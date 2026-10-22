@@ -141,7 +141,7 @@ export default function App() {
 
           setProgress({
             status: 'analyzing_ai',
-            message: 'Gemini 3.8 Flash анализирует титульные листы 5 разделов и штампы чертежей...',
+            message: 'Gemini анализирует титульные листы разделов и штампы чертежей...',
           });
 
           const res = await fetch('/api/extract-drawings', {
@@ -179,7 +179,14 @@ export default function App() {
               status: 'success',
               message: `Создан новый отбор: ${newTitle}! Извлечено ${data.items.length} чертежей.`,
             });
-            showToast(`Создан новый отбор! Извлечено ${data.items.length} чертежей по 5 разделам.`, 'success');
+            if (data.isDemoFallback) {
+              showToast(
+                data.message || 'Обработано в демонстрационном режиме (ключ Gemini API не настроен).',
+                'info'
+              );
+            } else {
+              showToast(`Создан новый отбор! Извлечено ${data.items.length} чертежей.`, 'success');
+            }
           } else {
             throw new Error('Чертежи не обнаружены в ответе');
           }
