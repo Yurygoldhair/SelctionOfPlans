@@ -32,10 +32,36 @@ export function loadAllSessions(): BatchSession[] {
 }
 
 export function saveAllSessions(sessions: BatchSession[]): void {
+  const serialize = (list: BatchSession[]) => JSON.stringify(list);
+
+  const trySave = (list: BatchSession[], stripPdf: boolean): boolean => {
+    let data = list;
+    if (stripPdf) {
+      // Drop heavy base64 payloads — keep only items + file names so the
+      // session history survives even when localStorage quota is exceeded.
+      data = list.map(s => ({ ...s, pdfBase64: undefined }));
+    }
+    for (let attempts = 0; attempts < 8; attempts++) {
+      try {
+        localStorage.setItem(SESSIONS_STORAGE_KEY, serialize(data));
+        return true;
+      } catch (e) {
+        if (data.length <= 1) break;
+        data = data.slice(0, Math.max(1, Math.floor(data.length / 2)));
+      }
+    }
+    return false;
+  };
+
   try {
     // Keep max 20 sessions to prevent localStorage overflow
     const trimmed = sessions.slice(0, 20);
-    localStorage.setItem(SESSIONS_STORAGE_KEY, JSON.stringify(trimmed));
+    if (!trySave(trimmed, false)) {
+      console.warn('localStorage quota exceeded — saving sessions without embedded PDFs');
+      if (!trySave(trimmed, true)) {
+        console.error('Unable to persist sessions to localStorage');
+      }
+    }
   } catch (e) {
     console.error('Error saving sessions to localStorage:', e);
   }
