@@ -296,10 +296,48 @@ function parseSpecRows(pageText: string, pageNum: number): RawItem[] {
   return out;
 }
 
+// ЕСКД designation like АБВГ.711142.012 / XXXX.XXXXXX.XXX(-YY)
+const DESIGNATION_RE = /\b[А-ЯЁA-Z]{2,10}\.\d{3,8}\.\d{2,4}(?:[-–.]\d{1,4})?\b/;
+
+// Generic table-row fallback for text PDFs whose layout doesn't match the
+// strict spec regex (rows extracted line-by-line from pdfjs text layer).
+function parseGenericRows(pageText: string, pageNum: number): RawItem[] {
+  const out: RawItem[] = [];
+  const lines = pageText.split('\n').map(l => l.trim()).filter(Boolean);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // skip headers/labels
+    if (/^(наименование|обозначение|спецификация|примечание|итого|всего|кол-?во|материал|лист\\s*\d)/i.test(line)) continue;
+    const desM = line.match(DESIGNATION_RE);
+    if (!desM) continue;
+    const before = line.slice(0, desM.index).replace(DESIGNATION_RE, '').trim();
+    // name candidate: starts with a capital letter and contains letters
+    const nameCand = before.replace(/^\d{1,3}[.)]?\s*/, '').replace(/[«»"]/g, '').trim();
+    if (nameCand.length < 3 || !/[А-ЯЁA-Z]/.test(nameCand[0]) || !/[а-яёa-z]{2}/.test(nameCand)) continue;
+    if (/^(ГОСТ|ОСТ|ТУ|DIN|ISO)\b/i.test(nameCand)) continue;
+    const qtyM = line.match(new RegExp(`${desM[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^\\d]{0,15}?(\\d{1,4})(?:\\s*шт)?(?!\\d)`));
+    out.push({
+      name: normalizeName(nameCand),
+      designation: desM[0],
+      quantity: qtyM ? parseInt(qtyM[1], 10) : null,
+      code1C: '',
+      partLength: extractPartLength(line),
+      isCnc: false,
+      hasNoStamp: false,
+      identificationMark: '',
+      material: '',
+      pageNumber: pageNum,
+      isHighlighted: false,
+      notes: 'Распознано по строке текста PDF',
+    });
+  }
+  return out;
+}
+
 // Free-marking fallback for sketch pages without a stamp
 function parseMarks(pageText: string, pageNum: number): RawItem[] {
   const out: RawItem[] = [];
-  const marks = [...pageText.matchAll(/(поз\.?\s*№?\s*\d+|дет\.?\s*№?\s*\d+|эскиз[^\n]{0,40}|секция\s*[а-яё])/gi)];
+  const marks = [...pageText.matchAll(/(поз\.?\s*№?\s*\d+|дет\.?\s*№?\s*\d+|изд\.?\s*[№#]?\s*[А-ЯЁA-Z0-9][\w.\-]{2,}|наплавл[^\n]{0,40}|заготовка[^\n]{0,40}|эскиз[^\n]{0,40}|секция\s*[а-яё])/gi)];
   const dims = pageText.match(/(?:Ø|⌀|ø|Φ|φ)\s*\d+(?:[.,]\d+)?\s*[хxX*]\s*\d+(?:[.,]\d+)?(?:\s*s\s*=\s*\d+)?/i);
   const qtyM = pageText.match(/(\d{1,4})\s*шт/i);
   for (const mk of marks.slice(0, 3)) {
@@ -323,7 +361,7 @@ function parseMarks(pageText: string, pageNum: number): RawItem[] {
   return out;
 }
 
-async function localExtractDrawings(pdfBase64: string): Promise<{ items: RawItem[]; detectedSections: string[] }> {
+async function localExtractDrawings(pdfBase64: string): Promise<{ items: RawItem[]; detectedSections: string[]; pageTexts: string[] }> {
   const pages = await extractPageText(pdfBase64);
   const items: RawItem[] = [];
   let currentSection: string = SECTIONS[0];
@@ -356,7 +394,10 @@ async function localExtractDrawings(pdfBase64: string): Promise<{ items: RawItem
         }
         pageItems = spec;
       } else {
-        pageItems = parseMarks(text, pageNum);
+        pageItems = parseGenericRows(text, pageNum);
+        if (pageItems.length === 0) {
+          pageItems = parseMarks(text, pageNum);
+        }
         for (const m of pageItems) m.section = currentSection;
       }
     }
@@ -380,7 +421,7 @@ async function localExtractDrawings(pdfBase64: string): Promise<{ items: RawItem
     return true;
   });
 
-  return { items: unique, detectedSections: [...detectedSections] };
+  return { items: unique, detectedSections: [...detectedSections], pageTexts: pages.map(t => (t || '').slice(0, 400)) };
 }
 
 app.get('/api/health', (req, res) => {
@@ -403,8 +444,10 @@ app.post('/api/extract-drawings', async (req, res) => {
   }
 
   // ---- Primary engine: LOCAL PDF parsing (no external AI API required) ----
+  let pageTexts: string[] = [];
   try {
     const local = await localExtractDrawings(pdfBase64);
+    pageTexts = local.pageTexts;
     if (local.items.length > 0) {
       const formattedItems = formatItems(local.items);
       console.log(`Local parser extracted ${formattedItems.length} position(s) from "${fileName || 'pdf'}"`);
@@ -426,6 +469,7 @@ app.post('/api/extract-drawings', async (req, res) => {
         details:
           'Локальный движок распознал бы все позиции, если бы в PDF был текст (штампы ЕСКД, спецификации). ' +
           'Похоже, что чертежи отсканированы как картинки. Для распознавания сканов добавьте ключ GEMINI_API_KEY в .env — тогда подключится vision-распознавание.',
+        pageTexts,
       });
     }
   } catch (localError: any) {
@@ -434,6 +478,7 @@ app.post('/api/extract-drawings', async (req, res) => {
       return res.status(500).json({
         error: 'Не удалось прочитать PDF-файл',
         details: String(localError?.message || localError),
+        pageTexts,
       });
     }
   }

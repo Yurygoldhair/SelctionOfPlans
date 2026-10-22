@@ -28,6 +28,7 @@ import {
   setActiveSessionId
 } from './utils/sessionStorage';
 import { generatePdfPageThumbnails } from './utils/pdfRenderer';
+import { recognizePdf, looksLikeScannedPdf } from './utils/recognize';
 import { CheckCircle, AlertCircle, Info, Sparkles } from 'lucide-react';
 
 export default function App() {
@@ -144,60 +145,56 @@ export default function App() {
             message: 'Локальный движок анализирует титульные листы разделов и штампы чертежей...',
           });
 
-          const res = await fetch('/api/extract-drawings', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              pdfBase64: base64Data,
-              fileName: file.name,
-            }),
+          const data = await recognizePdf(base64Data, file.name);
+
+          if (data.error) {
+            // Special case: PDF without a text layer (scan) — explain how to fix it.
+            if (data.error.status === 422 && looksLikeScannedPdf(data.pageTexts)) {
+              const msg = 'Похоже, PDF является сканом (картинки без текстового слоя). Локальный движок видит только векторные/текстовые PDF. Отсканируйте чертежи качественнее или добавьте ключ GEMINI_API_KEY в .env для распознавания сканов.';
+              setProgress({ status: 'error', message: msg });
+              showToast(msg, 'error');
+            } else {
+              const msg = data.error.details ? `${data.error.message}. ${data.error.details}` : data.error.message;
+              setProgress({ status: 'error', message: msg });
+              showToast(`Ошибка распознавания: ${msg}`, 'error');
+            }
+            return;
+          }
+
+          if (!data.items.length) {
+            throw new Error('В PDF не найдено ни одной позиции чертежей');
+          }
+
+          // "новая загрузка пдф это новый отбор"
+          const newTitle = `Отбор №${sessions.length + 1} — ${file.name.replace(/\.pdf$/i, '')}`;
+          const newSession = createNewSession(newTitle, data.items, file.name, base64Data);
+
+          setSessions(loadAllSessions());
+          setActiveSessionState(newSession.id);
+          setItems(data.items);
+          setCurrentPdfBase64(base64Data);
+          setCurrentPdfName(file.name);
+
+          // Generate thumbnails for the newly uploaded PDF
+          generatePdfPageThumbnails(base64Data, newSession.id).then(thumbs => {
+            setPdfThumbnails(thumbs);
           });
 
-          if (!res.ok) {
-            const errData = await res.json().catch(() => ({}));
-            const details = errData.details ? ` ${errData.details}` : '';
-            throw new Error((errData.error || `Ошибка сервера: ${res.status}`) + details);
-          }
-
-          const data = await res.json();
-          if (data.items && Array.isArray(data.items)) {
-            // "новая загрузка пдф это новый отбор"
-            const newTitle = `Отбор №${sessions.length + 1} — ${file.name.replace(/\.pdf$/i, '')}`;
-            const newSession = createNewSession(newTitle, data.items, file.name, base64Data);
-
-            setSessions(loadAllSessions());
-            setActiveSessionState(newSession.id);
-            setItems(data.items);
-            setCurrentPdfBase64(base64Data);
-            setCurrentPdfName(file.name);
-
-            // Generate thumbnails for the newly uploaded PDF
-            generatePdfPageThumbnails(base64Data, newSession.id).then(thumbs => {
-              setPdfThumbnails(thumbs);
-            });
-
-            setProgress({
-              status: 'success',
-              message: `Создан новый отбор: ${newTitle}! Извлечено ${data.items.length} чертежей.`,
-            });
-            if (data.isDemoFallback) {
-              showToast(
-                data.message || 'Обработано в демонстрационном режиме (ключ Gemini API не настроен).',
-                'info'
-              );
-            } else {
-              showToast(`Создан новый отбор! Извлечено ${data.items.length} чертежей.`, 'success');
-            }
-          } else {
-            throw new Error('Чертежи не обнаружены в ответе');
-          }
+          setProgress({
+            status: 'success',
+            message: `Создан новый отбор: ${newTitle}! Извлечено ${data.items.length} чертежей.`,
+          });
+          showToast(`Создан новый отбор! Извлечено ${data.items.length} чертежей (${data.engine === 'gemini' ? 'распознано Gemini' : 'локальный движок'}).`, 'success');
         } catch (err: any) {
           console.error(err);
+          const msg = err?.message === 'Failed to fetch'
+            ? 'Сервер недоступен. Убедитесь, что запущен командой npm run dev, и обновите страницу.'
+            : (err.message || 'Ошибка распознавания PDF');
           setProgress({
             status: 'error',
-            message: err.message || 'Ошибка распознавания PDF',
+            message: msg,
           });
-          showToast(`Ошибка распознавания: ${err.message}`, 'error');
+          showToast(`Ошибка распознавания: ${msg}`, 'error');
         }
       };
 
