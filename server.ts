@@ -16,14 +16,77 @@ const PORT = Number(process.env.PORT) || 3000;
 app.use(express.json({ limit: '50mb' }));
 
 // Initialize GoogleGenAI client (Server-side only)
+// Note: apiKey is intentionally optional here. If GEMINI_API_KEY is missing we
+// still create the client, but every AI call is guarded below and falls back to
+// demo data instead of throwing "API key not found" errors.
 const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
+  apiKey: process.env.GEMINI_API_KEY || '',
   httpOptions: {
     headers: {
       'User-Agent': 'aistudio-build',
     },
   },
 });
+
+// Candidate Gemini models, tried in order. The first non-404 model wins.
+// This makes the app resilient when a specific model name (e.g. a preview
+// model like 'gemini-3.8-flash') is not available for the current API key —
+// a wrong/unavailable model name was the cause of "Не удалось проанализировать PDF чертежи".
+const MODEL_CANDIDATES = [
+  process.env.GEMINI_MODEL,
+  'gemini-3.8-flash',
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+].filter((m): m is string => Boolean(m));
+
+/**
+ * Calls Gemini with the given prompt/PDF, trying candidate models until one works.
+ */
+async function generateWithModelFallback(
+  contents: any,
+  config: any
+): Promise<string> {
+  let lastError: any = null;
+
+  for (const model of MODEL_CANDIDATES) {
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents,
+        config,
+      });
+      const text = response.text;
+      if (!text) {
+        throw new Error(`Модель ${model} вернула пустой ответ`);
+      }
+      if (model !== MODEL_CANDIDATES[0]) {
+        console.log(`Gemini model "${model}" used (primary model unavailable).`);
+      }
+      return text;
+    } catch (error: any) {
+      lastError = error;
+      const status = error?.status ?? error?.response?.status;
+      const msg = String(error?.message || error);
+      console.error(`Gemini model "${model}" failed (status ${status}): ${msg}`);
+
+      // Only fall through to the next model on model-not-found / permission /
+      // unsupported errors. Other errors (network, payload size, etc.) are
+      // unlikely to be fixed by switching models, but trying the next one is
+      // still safer than crashing outright.
+      const isModelIssue =
+        status === 404 ||
+        status === 400 && /model|not found|unsupported/i.test(msg) ||
+        /not found|no such model|unsupported/i.test(msg);
+
+      if (!isModelIssue && status && status < 500 && status !== 408 && status !== 429) {
+        // 401/403 — bad API key, retrying with another model is pointless
+        if (status === 401 || status === 403) break;
+      }
+    }
+  }
+
+  throw lastError || new Error('Все модели Gemini недоступны');
+}
 
 app.get('/api/health', (req, res) => {
   res.json({
@@ -134,21 +197,38 @@ app.post('/api/extract-drawings', async (req, res) => {
       },
     };
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: {
-        parts: [
-          pdfPart,
-          { text: promptText },
-        ],
-      },
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-      },
-    });
+    let responseText: string;
+    try {
+      responseText = await generateWithModelFallback(
+        {
+          parts: [
+            pdfPart,
+            { text: promptText },
+          ],
+        },
+        {
+          systemInstruction,
+          responseMimeType: 'application/json',
+        }
+      );
+    } catch (aiError: any) {
+      const status = aiError?.status ?? aiError?.response?.status;
+      const msg = String(aiError?.message || aiError);
 
-    const responseText = response.text || '{}';
+      // If the API key is invalid/missing or no model is available, fall back
+      // to demo data instead of showing a hard error to the user.
+      if (status === 401 || status === 403 || /api.?key/i.test(msg)) {
+        console.warn('Gemini API key is missing or invalid. Returning demo fallback data.');
+        return res.json({
+          success: true,
+          isDemoFallback: true,
+          message: 'Ключ Gemini API не настроен или недействителен — обработано в демонстрационном режиме.',
+          items: getFallbackDemoItems(),
+        });
+      }
+      throw new Error(`Ошибка Gemini API: ${msg}`);
+    }
+
     let parsedData: any;
     try {
       parsedData = JSON.parse(responseText);
@@ -192,9 +272,23 @@ app.post('/api/extract-drawings', async (req, res) => {
     });
   } catch (error: any) {
     console.error('Error in /api/extract-drawings:', error);
+
+    // Network-level errors from the AI SDK (DNS/proxy/sandbox restrictions):
+    // e.g. "getaddrinfo EAI_AGAIN", "fetch failed", timeouts — fall back to demo mode
+    const msg = String(error?.message || error);
+    if (/EAI_AGAIN|ENOTFOUND|fetch failed|network|timeout|ETIMEDOUT|ECONNREFUSED|socket hang up/i.test(msg)) {
+      console.warn('Network error reaching Gemini API. Returning demo fallback data.');
+      return res.json({
+        success: true,
+        isDemoFallback: true,
+        message: 'Нет доступа к Gemini API из текущей среды — обработано в демонстрационном режиме.',
+        items: getFallbackDemoItems(),
+      });
+    }
+
     res.status(500).json({
       error: 'Не удалось проанализировать PDF чертежи',
-      details: error.message || String(error),
+      details: msg,
     });
   }
 });
