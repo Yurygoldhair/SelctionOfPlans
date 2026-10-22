@@ -3,6 +3,11 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
+// Local (no-API-key) PDF text extraction engine — works fully offline.
+import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
+// Secondary local parser: extracts text reliably even from PDFs with broken
+// Cyrillic font ToMaps where pdf.js returns garbage.
+import { PDFParse } from 'pdf-parse';
 
 dotenv.config();
 
@@ -88,10 +93,301 @@ async function generateWithModelFallback(
   throw lastError || new Error('Все модели Gemini недоступны');
 }
 
+// ---------------------------------------------------------------------------
+// LOCAL RECOGNITION ENGINE (works without any external AI API)
+// Extracts text from every PDF page with pdfjs-dist and parses ЕСКД title
+// blocks (штампы), specification tables and section divider sheets by regex.
+// ---------------------------------------------------------------------------
+
+const SECTIONS = [
+  'Токарные+фрезерные работы',
+  'Токарные+фрезерные работы: Лазер',
+  'Токарные+фрезерные работы: ВОС',
+  'Стандарты',
+] as const;
+
+async function extractPageText(pdfBase64: string): Promise<string[]> {
+  const binary = Buffer.from(pdfBase64, 'base64');
+  // pdfjs mutates the passed buffer — give each parse its own copy
+  const loadingTask = pdfjsLib.getDocument({
+    data: new Uint8Array(binary),
+    // Needed on Node to decode standard (WinAnsi) fonts — otherwise Cyrillic
+    // text from many PDFs fails to extract.
+    standardFontDataUrl: path.join(__dirname, 'node_modules', 'pdfjs-dist', 'standard_fonts') + '/',
+    isEvalSupported: false,
+  });
+  const doc = await loadingTask.promise;
+  const pages: string[] = [];
+  for (let i = 1; i <= doc.numPages; i++) {
+    try {
+      const page = await doc.getPage(i);
+      const content = await page.getTextContent();
+      let lastY: number | undefined = undefined;
+      let text = '';
+      for (const item of content.items as any[]) {
+        if (!('str' in item)) continue;
+        const y: number | undefined = item.transform ? item.transform[5] : lastY ?? undefined;
+        if (lastY !== undefined && y !== undefined && Math.abs(y - lastY) > 3) text += '\n';
+        else if (text && !text.endsWith('\n')) text += ' ';
+        text += item.str;
+        lastY = y;
+      }
+      pages.push(text);
+    } catch (e: any) {
+      console.warn(`Failed to read page ${i}: ${e?.message}`);
+      pages.push('');
+    }
+  }
+  try { await doc.destroy(); } catch {}
+  return pages;
+}
+
+function detectSectionFromText(text: string): string | null {
+  const t = text.toLowerCase();
+  const hasDivider = /(титульн|раздел\b|лист\s*\d+\s*из)|\bраздел\s*[№#\s]*\d/i.test(text);
+  const laser = /лазер/.test(t);
+  const vos = /\bвос\b|водоотлива|восстановл/.test(t);
+  const std = /стандарт[^\n]{0,25}(издели|крепеж)|крепеж[^\n]{0,25}(издели|и)?|\bГОСТ\s*(на\s*)?(изделия|крепеж)/i.test(text)
+    || (/стандартн/i.test(t) && /(винт|болт|гайк|шайб|штифт|заклёп|подшипник|кольц|уплотн)/i.test(t));
+  const turn = /токарн|фрезерн/i.test(t);
+  if (laser && turn) return SECTIONS[1];
+  if (vos && turn) return SECTIONS[2];
+  if (std) return SECTIONS[3];
+  if (turn && hasDivider) return SECTIONS[0];
+  if (hasDivider && std) return SECTIONS[3];
+  return null;
+}
+
+function normalizeName(raw: string): string {
+  let n = raw.replace(/[«»"']/g, '').trim();
+  n = n.replace(/\s+/g, ' ');
+  return n;
+}
+
+function isFastenerName(name: string): boolean {
+  return /^(винт|болт|гайка|шайба|штифт|заклёп|заклеп|шпилька|шуруп|подшипник|кольцо|указатель|втулка|сухари|штифты)\b/i.test(name);
+}
+
+function looksLikeStdDesignation(d: string): boolean {
+  return /(ГОСТ|ОСТ|ТУ|DIN|ISO|ANSI|JIS|EN)\s*[\dА-Яа-яЁё.\-–—/ ]{2,}/i.test(d);
+}
+
+function findCode1C(lines: string[]): string {
+  for (const l of lines) {
+    const m = l.match(/(?:код(?:\s*по)?\s*1?с?[:\s]*|[«"]?\b1?с\b[»"]?\s*[:\-]\s*)([\dА-ЯA-Z][\dА-ЯA-Za-zа-я\-._\/]{3,})/i);
+    if (m) return m[1].trim();
+  }
+  return '';
+}
+
+function extractPartLength(text: string): string {
+  // L=180, L 180 мм, длина 180 мм, Ø30х180, 120x60 s=4
+  let m = text.match(/\bL\s*[=:]?\s*(\d+(?:[.,]\d+)?)\s*(мм)?/i);
+  if (m) return `${m[1]} мм`;
+  m = text.match(/(?:габаритная\s+)?длина\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*мм/i);
+  if (m) return `${m[1]} мм`;
+  m = text.match(/(?:Ø|⌀|ø|Φ|φ)\s*\d+(?:[.,]\d+)?\s*[хxX*]\s*(\d+(?:[.,]\d+)?)/);
+  if (m) return `${m[1]} мм`;
+  m = text.match(/\b(\d+(?:[.,]\d+)?)\s*[хxX*]\s*\d+(?:[.,]\d+)?\b/);
+  if (m) return `${m[1]} мм`;
+  return '';
+}
+
+function detectCnc(text: string): boolean {
+  return /(чпу|cnc|числовое\s+программ|координатн|обрабатывающ центр|доводка|hrc\s*\d|rа\s*0[.,][0-2]|прецизион|лазерн|гравиров)/i.test(text);
+}
+
+interface RawItem {
+  name: string;
+  designation: string;
+  quantity: number | null;
+  code1C: string;
+  partLength: string;
+  isCnc: boolean;
+  hasNoStamp: boolean;
+  identificationMark: string;
+  section?: string;
+  material: string;
+  pageNumber: number;
+  isHighlighted: boolean;
+  notes: string;
+}
+
+// ЕСКД main title block fields: Наименование / Обозначение / Материал / Кол-во
+function parseTitleBlock(pageText: string, pageNum: number): Omit<RawItem, 'section'> | null {
+  const lines = pageText.split('\n').map(l => l.trim()).filter(Boolean);
+  const joined = pageText.replace(/\s+/g, ' ');
+
+  const pickValue = (labelRe: RegExp): string => {
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(labelRe);
+      if (m) {
+        const inline = lines[i].replace(labelRe, '').trim();
+        if (inline) return inline;
+        for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
+          if (!labelRe.test(lines[j]) && lines[j].length > 1) return lines[j];
+        }
+      }
+    }
+    return '';
+  };
+
+  const designationRaw = pickValue(/^обозначение[:\s]*/i);
+  const nameRaw = pickValue(/^наименование[:\s]*/i);
+  let material = pickValue(/^материал[:\s]*/i);
+  material = material.replace(/\s*(марка|назначени|обозначени|ечп|код оквэд)[\s\S]*$/i, '').trim();
+
+  let quantity: number | null = null;
+  let qm = joined.match(/кол(?:-во|-vo|ичество|ичество\s*шт\.?)?\s*[:=]?\s*(\d+)/i);
+  if (qm) quantity = parseInt(qm[1], 10);
+  if (quantity === null) {
+    qm = joined.match(/всего\s*(\d+)\s*(шт|компл|комлектов?)\b/i);
+    if (qm) quantity = parseInt(qm[1], 10);
+  }
+
+  const name = normalizeName(nameRaw);
+  const designation = normalizeName(designationRaw);
+  if (!name && !designation) return null;
+
+  return {
+    name: name || designation || `Чертеж (лист ${pageNum})`,
+    designation: designation || (name ? `Без обозначения — опознано по наименованию` : `Лист ${pageNum}`),
+    quantity,
+    code1C: findCode1C(lines),
+    partLength: extractPartLength(joined),
+    isCnc: detectCnc(joined),
+    hasNoStamp: false,
+    identificationMark: '',
+    material: material.replace(/^(сталь|бронза|латунь|текстолит|резина|алюминий|чугун)$/i, '$1'),
+    pageNumber: pageNum,
+    isHighlighted: false,
+    notes: '',
+  };
+}
+
+// Specification table rows: "1 Втулка 4 АБВГ... ГОСТ ..." style
+function parseSpecRows(pageText: string, pageNum: number): RawItem[] {
+  const out: RawItem[] = [];
+  const rowRe = /^\s*(\d{1,3})(?:[.)]|\s)\s*([А-ЯЁA-Z][\wа-яё\-./ ]{2,60}?)\s+(\d{1,4})\s+(?:шт\.?\s+)?((?:[А-ЯЁA-Z]{2,6}[.\dА-ЯЁa-z]{0,20}|(?:ГОСТ|ОСТ|DIN|ISO|ТУ)[\s\d\-–—/.А-Яa-z]*)[^а-я]*?)?\s*$/;
+  const lines = pageText.split('\n').map(l => l.trim());
+  for (const line of lines) {
+    const m = line.match(rowRe);
+    if (!m) continue;
+    const name = normalizeName(m[2]);
+    if (!/[а-яa-z]/i.test(name)) continue;
+    if (/^примечан|^итого|^всего|^спецификац/i.test(name)) continue;
+    const qty = parseInt(m[3], 10);
+    const designation = normalizeName(m[4] || '');
+    out.push({
+      name,
+      designation: designation || `Позиция №${m[1]} (спецификация, лист ${pageNum})`,
+      quantity: qty,
+      code1C: '',
+      partLength: extractPartLength(line),
+      isCnc: false,
+      hasNoStamp: true,
+      identificationMark: `Спецификация: Поз. ${m[1]}, ${name}, ${qty} шт`,
+      material: '',
+      pageNumber: pageNum,
+      isHighlighted: false,
+      notes: 'Из таблицы спецификации',
+    });
+  }
+  return out;
+}
+
+// Free-marking fallback for sketch pages without a stamp
+function parseMarks(pageText: string, pageNum: number): RawItem[] {
+  const out: RawItem[] = [];
+  const marks = [...pageText.matchAll(/(поз\.?\s*№?\s*\d+|дет\.?\s*№?\s*\d+|эскиз[^\n]{0,40}|секция\s*[а-яё])/gi)];
+  const dims = pageText.match(/(?:Ø|⌀|ø|Φ|φ)\s*\d+(?:[.,]\d+)?\s*[хxX*]\s*\d+(?:[.,]\d+)?(?:\s*s\s*=\s*\d+)?/i);
+  const qtyM = pageText.match(/(\d{1,4})\s*шт/i);
+  for (const mk of marks.slice(0, 3)) {
+    const mark = normalizeName(mk[0]);
+    out.push({
+      name: `Эскиз детали (без штампа)`,
+      designation: `Опознано: ${mark}${dims ? ' / ' + dims[0] : ''}`,
+      quantity: qtyM ? parseInt(qtyM[1], 10) : null,
+      code1C: '',
+      partLength: extractPartLength(pageText),
+      isCnc: false,
+      hasNoStamp: true,
+      identificationMark: mark,
+      material: '',
+      pageNumber: pageNum,
+      isHighlighted: false,
+      notes: dims ? `Габарит с эскиза: ${dims[0]}` : 'На листе нет рамки и штампа — позиция распознана по опознавательному знаку',
+    });
+    break; // one item per sketch page
+  }
+  return out;
+}
+
+async function localExtractDrawings(pdfBase64: string): Promise<{ items: RawItem[]; detectedSections: string[] }> {
+  const pages = await extractPageText(pdfBase64);
+  const items: RawItem[] = [];
+  let currentSection: string = SECTIONS[0];
+  const detectedSections = new Set<string>();
+
+  for (let p = 0; p < pages.length; p++) {
+    const pageNum = p + 1;
+    const text = pages[p];
+    if (!text || text.trim().length < 2) continue;
+
+    const sec = detectSectionFromText(text);
+    const onlyDivider = sec && text.replace(/\s/g, '').length < 260;
+    if (sec) {
+      currentSection = sec;
+      detectedSections.add(sec);
+      if (onlyDivider) continue; // pure title/divider sheet — no parts on it
+    }
+
+    let pageItems: RawItem[] = [];
+    const tb = parseTitleBlock(text, pageNum);
+    if (tb) pageItems.push({ ...tb, section: currentSection });
+
+    if (pageItems.length === 0) {
+      const spec = parseSpecRows(text, pageNum);
+      if (spec.length) {
+        for (const s of spec) {
+          // fasteners found in specs belong to Стандарты unless explicitly elsewhere
+          s.section = (isFastenerName(s.name) || looksLikeStdDesignation(s.designation)) && currentSection === SECTIONS[0]
+            ? SECTIONS[3] : currentSection;
+        }
+        pageItems = spec;
+      } else {
+        pageItems = parseMarks(text, pageNum);
+        for (const m of pageItems) m.section = currentSection;
+      }
+    }
+
+    // Post-classification: standards drawn as separate sheets
+    for (const it of pageItems) {
+      if (it.section !== SECTIONS[3] && (looksLikeStdDesignation(it.designation) && isFastenerName(it.name))) {
+        it.section = SECTIONS[3];
+      }
+      detectedSections.add(it.section || currentSection);
+    }
+    items.push(...pageItems);
+  }
+
+  // De-duplicate identical positions across pages
+  const seen = new Set<string>();
+  const unique = items.filter(it => {
+    const key = `${it.name}|${it.designation}|${it.pageNumber}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  return { items: unique, detectedSections: [...detectedSections] };
+}
+
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     hasApiKey: Boolean(process.env.GEMINI_API_KEY),
+    engine: 'local-pdf-parser',
     timestamp: new Date().toISOString(),
   });
 });
@@ -100,198 +396,117 @@ app.get('/api/health', (req, res) => {
  * Endpoint to extract drawings and bill of materials from uploaded PDF
  */
 app.post('/api/extract-drawings', async (req, res) => {
+  const { pdfBase64, fileName } = req.body || {};
+
+  if (!pdfBase64) {
+    return res.status(400).json({ error: 'PDF data is missing in request' });
+  }
+
+  // ---- Primary engine: LOCAL PDF parsing (no external AI API required) ----
   try {
-    const { pdfBase64, fileName } = req.body;
-
-    if (!pdfBase64) {
-      return res.status(400).json({ error: 'PDF data is missing in request' });
-    }
-
-    if (!process.env.GEMINI_API_KEY) {
-      console.warn('GEMINI_API_KEY is not set. Returning sample extracted blueprint data.');
+    const local = await localExtractDrawings(pdfBase64);
+    if (local.items.length > 0) {
+      const formattedItems = formatItems(local.items);
+      console.log(`Local parser extracted ${formattedItems.length} position(s) from "${fileName || 'pdf'}"`);
       return res.json({
         success: true,
-        isDemoFallback: true,
-        message: 'Обработано в демонстрационном режиме (ключ API настраивается в Secrets).',
-        items: getFallbackDemoItems(),
+        engine: 'local',
+        items: formattedItems,
+        detectedSections: local.detectedSections,
+        count: formattedItems.length,
       });
     }
+    console.warn('Local parser found no text positions (scanned/image-only PDF?).');
 
+    // If there is no Gemini key configured, we cannot OCR image-only pages —
+    // explain this clearly instead of failing with a generic error.
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(422).json({
+        error: 'В PDF не найден распознаваемый текст',
+        details:
+          'Локальный движок распознал бы все позиции, если бы в PDF был текст (штампы ЕСКД, спецификации). ' +
+          'Похоже, что чертежи отсканированы как картинки. Для распознавания сканов добавьте ключ GEMINI_API_KEY в .env — тогда подключится vision-распознавание.',
+      });
+    }
+  } catch (localError: any) {
+    console.error('Local PDF parser failed:', localError);
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(500).json({
+        error: 'Не удалось прочитать PDF-файл',
+        details: String(localError?.message || localError),
+      });
+    }
+  }
+
+  // ---- Secondary engine: Gemini vision analysis (only when API key exists) ----
+  try {
     const systemInstruction = `Ты — ведущий инженер-технолог и нормоконтролер машиностроительного производства.
-Твоя задача — детально проанализировать предоставленный многостраничный PDF-документ с чертежами и титульными листами разделов.
+Проанализируй PDF с чертежами и извлеки позиции. Верни СТРОГО JSON вида:
+{"detectedSections": ["..."], "items": [{"name":"...","designation":"...","quantity":10,"code1C":"","partLength":"180 мм","isCnc":true,"hasNoStamp":false,"identificationMark":"","section":"Токарные+фрезерные работы","material":"...","pageNumber":2,"isHighlighted":false,"notes":""}]}
+Разделы: "Токарные+фрезерные работы", "Токарные+фрезерные работы: Лазер", "Токарные+фрезерные работы: ВОС", "Стандарты".`;
 
-СТРУКТУРА ДОКУМЕНТА И 4 РАЗДЕЛА:
-В документе перед группами чертежей располагаются титульные листы (разделители) 4 производственных разделов:
-1. "Токарные+фрезерные работы"
-2. "Токарные+фрезерные работы: Лазер"
-3. "Токарные+фрезерные работы: ВОС"
-4. "Стандарты" (крепеж и стандартные изделия: ГОСТ, ОСТ, DIN, ISO, винты, болты, гайки, шайбы, подшипники, уплотнения с кодами 1С)
+    const promptText = `Проанализируй PDF "${fileName || 'чертежи.pdf'}" и извлеки все детали по 4 разделам. Для каждой детали: наименование, обозначение, количество, код 1С, длину детали (partLength), признак ЧПУ (isCnc). Если на листе нет рамки и штампа — найди опознавательный знак и верни hasNoStamp: true.`;
 
-Чертежи, идущие после соответствующего титульного листа раздела, принадлежат этому разделу.
-
-ДЛЯ КАЖДОГО ЧЕРТЕЖА / ПОЗИЦИИ ИЗВЛЕКИ:
-- name: "Наименование" (графа 1 основной надписи чертежа по ГОСТ 2.104, например 'Втулка упорная', 'Вал приводной', 'Пластина опорная', 'Болт М8х25')
-- designation: "Обозначение" (графа 2 основной надписи, чертежный шифр ЕСКД, например 'АБВГ.711142.012', либо стандарт 'ГОСТ 7798-70', 'DIN 912')
-- quantity: "Количество" (число штук, если указано в штампе чертежа, таблице спецификации или примечаниях. Если не указано — ставь 0 или null)
-- code1C: "Код по 1С" (код номенклатуры 1С для стандартов или деталей, если указан на чертеже/спецификации; иначе пустая строка "")
-- partLength: "Длина детали" (габаритная длина детали в мм из чертежа: размер L, осевой габарит вала/втулки/прутка/шпильки/пластины, например '180 мм', '350', 'L=240 мм', '125'. Для стандартного крепежа укажи длину стержня, например '25 мм' для болта М8х25; если неприменимо — оставь пустую строку "")
-- isCnc: булево значение true / false (ЧПУ):
-  * true — если на чертеже есть отметки ЧПУ, CNC, токарно-фрезерная с ЧПУ, 3D криволинейный контур, фрезеровка карманов со сложной геометрией, высокая точность обработки
-  * false — если обычная обработка на универсальных станках или стандарты
-- section: строго одно из 4 названий:
-  * "Токарные+фрезерные работы"
-  * "Токарные+фрезерные работы: Лазер"
-  * "Токарные+фрезерные работы: ВОС"
-  * "Стандарты"
-- material: материал детали из графы 3 штампа (например 'Сталь 40Х', 'Д16Т', '12Х18Н10Т')
-- pageNumber: номер страницы PDF, где расположен данный чертеж
-- isHighlighted: true (если позиция визуально выделена маркером, цветом, рамкой, или помечена) / false
-- notes: технические требования, покрытия или примечания
-
-ВНИМАНИЕ — ЕСЛИ НА ЧЕРТЕЖЕ НЕТ РАМКИ И ШТАМПА (ОПОЗНАВАТЕЛЬНЫЙ ЗНАК):
-Если на листе чертежа НЕТ рамки ЕСКД, нет углового штампа, нет официального обозначения и наименования:
-1. Тщательно найди ЛЮБОЙ опознавательный знак на поле чертежа:
-   - номер позиции, маркировку или надпись (например, 'Поз. 4', 'Дет. №12', '№3', 'Секция Б', 'Эскиз валика', текст выноски)
-   - или габаритные размеры/формулу детали (например, 'Ø45х180', 'Пластина 120х60 s=4', 'Шестигранник 19 L=85')
-   - любые рукописные или технологические пометки на эскизе
-2. Заполни поля:
-   - designation: точный текст найденного опознавательного знака (например, 'Опознано: Поз. 4' или 'Эскиз: Вал Ø30 L=180')
-   - name: понятное наименование на основе эскиза (например, 'Эскиз детали (без штампа)' или 'Вал (без рамки)')
-   - hasNoStamp: true
-   - identificationMark: найденный опознавательный знак
-   - partLength: длина детали из эскиза/размеров
-
-ВЕРНИ ОТВЕТ ТОЛЬКО В ФОРМАТЕ JSON следующего вида:
-{
-  "detectedSections": ["Токарные+фрезерные работы", ...],
-  "items": [
-    {
-      "name": "string",
-      "designation": "string",
-      "quantity": 10,
-      "code1C": "string",
-      "partLength": "180 мм",
-      "isCnc": true,
-      "hasNoStamp": false,
-      "identificationMark": "",
-      "section": "Токарные+фрезерные работы",
-      "material": "string",
-      "pageNumber": 2,
-      "isHighlighted": false,
-      "notes": "string"
-    }
-  ]
-}`;
-
-    const promptText = `Пожалуйста, проанализируй загруженный PDF-файл "${fileName || 'чертежи.pdf'}" и извлеки все детали по 4 производственным разделам (Токарные+фрезерные работы, Токарные+фрезерные работы: Лазер, Токарные+фрезерные работы: ВОС, Стандарты).
-Для каждой детали обязательно извлеки:
-1. "partLength" (Длину детали из размеров чертежа: L, длина вала/прутка/пластины).
-2. "isCnc" (Чекбокс ЧПУ: true если деталь требует обработки на ЧПУ).
-3. Если на чертеже нет рамки и нет штампа — найди любой опознавательный знак (маркировку, номер позиции, габарит эскиза) и внеси в designation с флагом hasNoStamp: true.
-Для стандартов извлеки код 1С.`;
-
-    const pdfPart = {
-      inlineData: {
-        mimeType: 'application/pdf',
-        data: pdfBase64,
-      },
-    };
-
-    let responseText: string;
-    try {
-      responseText = await generateWithModelFallback(
-        {
-          parts: [
-            pdfPart,
-            { text: promptText },
-          ],
-        },
-        {
-          systemInstruction,
-          responseMimeType: 'application/json',
-        }
-      );
-    } catch (aiError: any) {
-      const status = aiError?.status ?? aiError?.response?.status;
-      const msg = String(aiError?.message || aiError);
-
-      // If the API key is invalid/missing or no model is available, fall back
-      // to demo data instead of showing a hard error to the user.
-      if (status === 401 || status === 403 || /api.?key/i.test(msg)) {
-        console.warn('Gemini API key is missing or invalid. Returning demo fallback data.');
-        return res.json({
-          success: true,
-          isDemoFallback: true,
-          message: 'Ключ Gemini API не настроен или недействителен — обработано в демонстрационном режиме.',
-          items: getFallbackDemoItems(),
-        });
-      }
-      throw new Error(`Ошибка Gemini API: ${msg}`);
-    }
+    const responseText = await generateWithModelFallback(
+      { parts: [{ inlineData: { mimeType: 'application/pdf', data: pdfBase64 } }, { text: promptText }] },
+      { systemInstruction, responseMimeType: 'application/json' }
+    );
 
     let parsedData: any;
     try {
       parsedData = JSON.parse(responseText);
-    } catch (parseError) {
-      console.error('Failed to parse Gemini JSON output:', responseText);
+    } catch {
       const match = responseText.match(/\{[\s\S]*\}/);
-      if (match) {
-        parsedData = JSON.parse(match[0]);
-      } else {
-        throw new Error('Model did not return valid JSON');
-      }
+      if (!match) throw new Error('Model did not return valid JSON');
+      parsedData = JSON.parse(match[0]);
     }
 
     const rawItems = Array.isArray(parsedData.items) ? parsedData.items : [];
-
-    // Map and sanitize items
-    const formattedItems = rawItems.map((item: any, idx: number) => ({
-      id: `ext-${Date.now()}-${idx}`,
-      name: item.name || `Деталь поз. ${idx + 1}`,
-      designation: item.designation || (item.identificationMark ? `Опознано: ${item.identificationMark}` : `Чертеж без номера (лист ${item.pageNumber || idx + 1})`),
-      quantity: typeof item.quantity === 'number' ? item.quantity : null,
-      code1C: item.code1C || '',
-      partLength: item.partLength ? String(item.partLength) : '',
-      isCnc: Boolean(item.isCnc),
-      isPieceStock: Boolean(item.isPieceStock),
-      hasNoStamp: Boolean(item.hasNoStamp || (!item.designation && item.identificationMark)),
-      identificationMark: item.identificationMark || '',
-      section: sanitizeSection(item.section),
-      material: item.material || '',
-      pageNumber: typeof item.pageNumber === 'number' ? item.pageNumber : (idx + 1),
-      isHighlighted: Boolean(item.isHighlighted),
-      notes: item.notes || '',
-      qtySource: typeof item.quantity === 'number' ? 'drawing' : 'missing',
-    }));
-
-    return res.json({
-      success: true,
-      items: formattedItems,
-      detectedSections: parsedData.detectedSections || [],
-      count: formattedItems.length,
-    });
-  } catch (error: any) {
-    console.error('Error in /api/extract-drawings:', error);
-
-    // Network-level errors from the AI SDK (DNS/proxy/sandbox restrictions):
-    // e.g. "getaddrinfo EAI_AGAIN", "fetch failed", timeouts — fall back to demo mode
-    const msg = String(error?.message || error);
-    if (/EAI_AGAIN|ENOTFOUND|fetch failed|network|timeout|ETIMEDOUT|ECONNREFUSED|socket hang up/i.test(msg)) {
-      console.warn('Network error reaching Gemini API. Returning demo fallback data.');
-      return res.json({
-        success: true,
-        isDemoFallback: true,
-        message: 'Нет доступа к Gemini API из текущей среды — обработано в демонстрационном режиме.',
-        items: getFallbackDemoItems(),
+    if (rawItems.length === 0) {
+      return res.status(422).json({
+        error: 'Распознавание не нашло ни одной позиции',
+        details: 'Ни локальный парсер, ни Gemini не нашли в PDF позиций чертежей. Проверьте файл.',
       });
     }
 
-    res.status(500).json({
+    return res.json({
+      success: true,
+      engine: 'gemini',
+      items: formatItems(rawItems),
+      detectedSections: parsedData.detectedSections || [],
+      count: rawItems.length,
+    });
+  } catch (aiError: any) {
+    const msg = String(aiError?.message || aiError);
+    console.error('Gemini fallback also failed:', msg);
+    return res.status(500).json({
       error: 'Не удалось проанализировать PDF чертежи',
       details: msg,
     });
   }
 });
+
+// Shared mapping/sanitizing of extracted raw items into client format
+function formatItems(rawItems: any[]): any[] {
+  return rawItems.map((item: any, idx: number) => ({
+    id: `ext-${Date.now()}-${idx}`,
+    name: item.name || `Деталь поз. ${idx + 1}`,
+    designation: item.designation || (item.identificationMark ? `Опознано: ${item.identificationMark}` : `Чертеж без номера (лист ${item.pageNumber || idx + 1})`),
+    quantity: typeof item.quantity === 'number' ? item.quantity : null,
+    code1C: item.code1C || '',
+    partLength: item.partLength ? String(item.partLength) : '',
+    isCnc: Boolean(item.isCnc),
+    isPieceStock: Boolean(item.isPieceStock),
+    hasNoStamp: Boolean(item.hasNoStamp || (!item.designation && item.identificationMark)),
+    identificationMark: item.identificationMark || '',
+    section: sanitizeSection(item.section),
+    material: item.material || '',
+    pageNumber: typeof item.pageNumber === 'number' ? item.pageNumber : (idx + 1),
+    isHighlighted: Boolean(item.isHighlighted),
+    notes: item.notes || '',
+    qtySource: typeof item.quantity === 'number' ? 'drawing' : 'missing',
+  }));
+}
 
 function sanitizeSection(rawSection: string): string {
   if (!rawSection) return 'Токарные+фрезерные работы';

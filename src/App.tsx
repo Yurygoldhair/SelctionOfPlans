@@ -141,7 +141,7 @@ export default function App() {
 
           setProgress({
             status: 'analyzing_ai',
-            message: 'Gemini анализирует титульные листы разделов и штампы чертежей...',
+            message: 'Локальный движок анализирует титульные листы разделов и штампы чертежей...',
           });
 
           const res = await fetch('/api/extract-drawings', {
@@ -155,7 +155,8 @@ export default function App() {
 
           if (!res.ok) {
             const errData = await res.json().catch(() => ({}));
-            throw new Error(errData.error || errData.details || `Ошибка сервера: ${res.status}`);
+            const details = errData.details ? ` ${errData.details}` : '';
+            throw new Error((errData.error || `Ошибка сервера: ${res.status}`) + details);
           }
 
           const data = await res.json();
