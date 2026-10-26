@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { DrawingItem, StampOptions } from '../types';
+import { DrawingItem, StampOptions, isRodOrStud } from '../types';
 import {
   FileText,
   Download,
@@ -32,18 +32,22 @@ export const GeneratePdfModal: React.FC<GeneratePdfModalProps> = ({
   pdfFileName,
 }) => {
   const [position, setPosition] = useState<'top-left-eskd' | 'top-right' | 'above-stamp' | 'top-left'>('top-left-eskd');
-  const [format, setFormat] = useState<'kd-billet' | 'qty-only' | 'with-prefix'>('kd-billet');
+  const [format, setFormat] = useState<'kd-billet' | 'qty-only' | 'with-prefix'>('qty-only');
   const [fontSize, setFontSize] = useState<number>(13); // 13pt scaled to fit the 14mm frame
   const [stampColor, setStampColor] = useState<string>('#000000');
   const [eraseOldDesignation, setEraseOldDesignation] = useState(true);
   const [offsetX, setOffsetX] = useState<number>(0); // mm
   const [offsetY, setOffsetY] = useState<number>(0); // mm
+  const [printBillet, setPrintBillet] = useState<boolean>(true);
+  const [billetOffsetX, setBilletOffsetX] = useState<number>(0); // mm
+  const [billetOffsetY, setBilletOffsetY] = useState<number>(0); // mm
   const [isProcessing, setIsProcessing] = useState(false);
 
   if (!isOpen) return null;
 
   const totalQty = items.reduce((sum, it) => sum + (it.quantity || 0), 0);
   const missingQtyCount = items.filter(it => it.quantity === null || it.quantity === 0).length;
+  const rodsAndStuds = items.filter(it => isRodOrStud(it));
 
   const handleGenerate = async () => {
     try {
@@ -58,12 +62,15 @@ export const GeneratePdfModal: React.FC<GeneratePdfModalProps> = ({
         eraseOldDesignation,
         offsetX_mm: offsetX,
         offsetY_mm: offsetY,
+        printBilletStamp: printBillet,
+        billetOffsetX_mm: billetOffsetX,
+        billetOffsetY_mm: billetOffsetY,
       };
 
       const pdfBytes = await generateProductionPdfWithQuantities(items, pdfBase64, options);
       const outputName = pdfFileName
-        ? `${pdfFileName.replace(/\.pdf$/i, '')}_(с_количеством_ЕСКД).pdf`
-        : `Комплект_чертежей_с_количеством_(ЕСКД).pdf`;
+        ? `${pdfFileName.replace(/\.pdf$/i, '')}_(с_количеством_и_Lзаг_ЕСКД).pdf`
+        : `Комплект_чертежей_с_количеством_и_Lзаг_(ЕСКД).pdf`;
 
       downloadPdfFile(pdfBytes, outputName);
       onClose();
@@ -126,6 +133,11 @@ export const GeneratePdfModal: React.FC<GeneratePdfModalProps> = ({
               <li>
                 <strong>Дубликат обозначения:</strong> аккуратно закрашивается белым прямоугольником, внутрь вносится количество.
               </li>
+              {rodsAndStuds.length > 0 && (
+                <li className="text-emerald-300 font-semibold">
+                  <strong>Прутки и шпильки ({rodsAndStuds.length} поз.):</strong> включены в итоговый PDF-пакет с простановкой штампов (при этом они не отображаются в таблице механических деталей).
+                </li>
+              )}
             </ul>
           </div>
 
@@ -309,39 +321,126 @@ export const GeneratePdfModal: React.FC<GeneratePdfModalProps> = ({
                   className="rounded border-slate-700 text-blue-600 focus:ring-0"
                 />
                 <span className="text-slate-200 text-xs">
-                  Закрасить дубликат обозначения белым цветом в Графе 26
+                  Закрасить дубликат обозначения белым цветом в Графе 26 (верхний левый угол)
                 </span>
               </label>
             )}
 
+            {/* Billet Stamp Options (слева от обозначения в рамке) */}
+            <div className="p-3 rounded-xl bg-amber-950/20 border border-amber-500/30 space-y-2.5">
+              <label className="flex items-center space-x-2.5 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={printBillet}
+                  onChange={(e) => setPrintBillet(e.target.checked)}
+                  className="rounded border-slate-700 text-amber-500 focus:ring-0"
+                />
+                <div>
+                  <span className="text-amber-200 font-semibold text-xs block">
+                    Записывать длину заготовки слева от обозначения в рамке (Lзаг)
+                  </span>
+                  <span className="text-[11px] text-slate-400 block">
+                    Печатается в основной надписи чертежа на свободном месте слева от шифра детали
+                  </span>
+                </div>
+              </label>
+
+              {printBillet && (
+                <div className="pt-2 border-t border-amber-600/30 flex items-center justify-between text-xs">
+                  <span className="text-slate-400">Смещение Lзаг (мм):</span>
+                  <div className="flex items-center space-x-2">
+                    <div className="flex items-center space-x-1">
+                      <button
+                        type="button"
+                        onClick={() => setBilletOffsetX(prev => prev - 1)}
+                        className="px-1.5 py-0.5 bg-slate-800 rounded font-mono text-amber-300"
+                        title="Сдвиг влево на 1 мм"
+                      >
+                        ←
+                      </button>
+                      <span className="font-mono text-[11px] text-amber-200 w-8 text-center">
+                        X:{billetOffsetX}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setBilletOffsetX(prev => prev + 1)}
+                        className="px-1.5 py-0.5 bg-slate-800 rounded font-mono text-amber-300"
+                        title="Сдвиг вправо на 1 мм"
+                      >
+                        →
+                      </button>
+                    </div>
+
+                    <div className="flex items-center space-x-1 ml-1 pl-1 border-l border-amber-700/50">
+                      <button
+                        type="button"
+                        onClick={() => setBilletOffsetY(prev => prev + 1)}
+                        className="px-1.5 py-0.5 bg-slate-800 rounded font-mono text-amber-300"
+                        title="Сдвиг вверх на 1 мм"
+                      >
+                        ↑
+                      </button>
+                      <span className="font-mono text-[11px] text-amber-200 w-8 text-center">
+                        Y:{billetOffsetY}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setBilletOffsetY(prev => prev - 1)}
+                        className="px-1.5 py-0.5 bg-slate-800 rounded font-mono text-amber-300"
+                        title="Сдвиг вниз на 1 мм"
+                      >
+                        ↓
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
           </div>
 
           {/* Live Preview Box */}
-          <div className="p-3.5 rounded-xl bg-white border border-slate-200 text-slate-900 flex items-center justify-between">
-            <div>
-              <div className="text-[11px] font-semibold text-slate-700">
-                {isEskdBox ? 'Вид в рамочке чертежа (Графа 26):' : 'Вид штампа:'}
-              </div>
-              <div className="text-[10px] text-slate-500">
-                {format === 'kd-billet' ? 'Пример: Lдет=180мм, 10 шт, ЧПУ' : 'Пример для 12 шт.'}
-              </div>
+          <div className="p-3.5 rounded-xl bg-white border border-slate-200 text-slate-900 space-y-2">
+            <div className="text-[11px] font-semibold text-slate-700 flex items-center justify-between">
+              <span>Вид двух надписей на чертеже:</span>
+              <span className="text-[10px] text-blue-600 font-normal">ГОСТ 2.104</span>
             </div>
-            <div
-              style={{
-                fontFamily: 'Arial, sans-serif',
-                fontSize: `${fontSize}px`,
-                color: stampColor,
-                borderColor: stampColor,
-                width: isEskdBox ? '180px' : 'auto',
-                height: isEskdBox ? '34px' : 'auto',
-              }}
-              className="font-bold px-4 py-1 bg-white border-2 border-black rounded flex items-center justify-center text-center shadow-sm font-mono tracking-wide"
-            >
-              {format === 'kd-billet'
-                ? 'Lзаг=955-2'
-                : format === 'qty-only'
-                ? '12 шт.'
-                : 'Кол-во: 12 шт.'}
+            
+            <div className="grid grid-cols-2 gap-3">
+              {/* Stamp 1: Quantity */}
+              <div className="border border-slate-300 p-2 rounded bg-slate-50 flex flex-col items-center">
+                <span className="text-[10px] text-slate-500 font-medium mb-1">
+                  1. Верхний левый угол (кол-во):
+                </span>
+                <div
+                  style={{
+                    fontFamily: 'Arial, sans-serif',
+                    fontSize: `${fontSize}px`,
+                  }}
+                  className="font-bold px-3 py-1 bg-white border-2 border-black rounded text-center shadow-sm font-mono tracking-wide w-full max-w-[150px]"
+                >
+                  {format === 'with-prefix' ? 'Кол-во: 12 шт.' : '12 шт.'}
+                </div>
+              </div>
+
+              {/* Stamp 2: Billet Length */}
+              <div className="border border-slate-300 p-2 rounded bg-slate-50 flex flex-col items-center">
+                <span className="text-[10px] text-slate-500 font-medium mb-1">
+                  2. Строго слева от обозначения:
+                </span>
+                <div
+                  style={{
+                    fontFamily: 'Arial, sans-serif',
+                    fontSize: '11px',
+                  }}
+                  className="font-bold px-2 py-1 bg-white border-2 border-black rounded text-center shadow-sm font-mono tracking-tight w-full max-w-[155px]"
+                >
+                  Lзаг=955- 2 шт.
+                </div>
+                <span className="text-[9px] text-slate-500 mt-0.5">
+                  (или «заг. на пред. чертеже»)
+                </span>
+              </div>
             </div>
           </div>
 

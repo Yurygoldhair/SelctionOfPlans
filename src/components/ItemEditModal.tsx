@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { DrawingItem, SECTIONS, SectionType } from '../types';
-import { X, Save, Plus, Cpu, Ruler, AlertTriangle, Box, Calculator } from 'lucide-react';
+import { X, Save, Plus, Cpu, Ruler, AlertTriangle, Box, Calculator, Layers } from 'lucide-react';
 import { calculateBillet } from '../utils/billetCalculator';
 
 interface ItemEditModalProps {
@@ -26,8 +26,11 @@ export const ItemEditModal: React.FC<ItemEditModalProps> = ({
     section: defaultSection || 'Токарные+фрезерные работы',
     material: '',
     partLength: '',
+    manualBilletLength: null,
     isCnc: false,
     isPieceStock: false,
+    combinedBilletGroupId: undefined,
+    combinedBilletName: undefined,
     hasNoStamp: false,
     identificationMark: '',
     pageNumber: 1,
@@ -47,8 +50,11 @@ export const ItemEditModal: React.FC<ItemEditModalProps> = ({
         section: defaultSection || 'Токарные+фрезерные работы',
         material: '',
         partLength: '',
+        manualBilletLength: null,
         isCnc: false,
         isPieceStock: false,
+        combinedBilletGroupId: undefined,
+        combinedBilletName: undefined,
         hasNoStamp: false,
         identificationMark: '',
         pageNumber: 1,
@@ -71,8 +77,11 @@ export const ItemEditModal: React.FC<ItemEditModalProps> = ({
       section: (formData.section as SectionType) || 'Токарные+фрезерные работы',
       material: formData.material || '',
       partLength: formData.partLength || '',
+      manualBilletLength: formData.manualBilletLength ? Number(formData.manualBilletLength) : null,
       isCnc: Boolean(formData.isCnc),
       isPieceStock: Boolean(formData.isPieceStock),
+      combinedBilletGroupId: formData.combinedBilletGroupId,
+      combinedBilletName: formData.combinedBilletName,
       hasNoStamp: Boolean(formData.hasNoStamp),
       identificationMark: formData.identificationMark || '',
       pageNumber: formData.pageNumber || undefined,
@@ -237,6 +246,42 @@ export const ItemEditModal: React.FC<ItemEditModalProps> = ({
             </div>
           </div>
 
+          {/* Manual Billet Length Override */}
+          <div className="p-3 bg-slate-800/60 border border-slate-700/80 rounded-xl space-y-1.5">
+            <div className="flex items-center justify-between">
+              <label className="text-slate-300 font-semibold flex items-center space-x-1.5">
+                <Calculator className="w-3.5 h-3.5 text-amber-400" />
+                <span>Ручная длина заготовки (Lзаг)</span>
+              </label>
+              {formData.manualBilletLength ? (
+                <button
+                  type="button"
+                  onClick={() => setFormData({ ...formData, manualBilletLength: null })}
+                  className="text-amber-400 hover:text-white text-[11px] underline"
+                >
+                  Сбросить на авторасчет
+                </button>
+              ) : null}
+            </div>
+            <div className="flex items-center space-x-2">
+              <input
+                type="number"
+                min="1"
+                value={formData.manualBilletLength ?? ''}
+                onChange={(e) => {
+                  const val = e.target.value === '' ? null : Number(e.target.value);
+                  setFormData({ ...formData, manualBilletLength: val });
+                }}
+                placeholder="Не задано (действует авторасчет по формуле)"
+                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-amber-300 font-mono font-medium focus:outline-none focus:border-amber-500 text-xs"
+              />
+              <span className="text-slate-400 font-mono text-xs">мм</span>
+            </div>
+            <p className="text-[10px] text-slate-400">
+              Если заполнено, расчетная формула игнорируется, и в штамп чертежа и ведомость пойдет введенная длина.
+            </p>
+          </div>
+
           {/* Dynamic Billet Preview Card */}
           {(() => {
             const liveBillet = calculateBillet({
@@ -244,14 +289,17 @@ export const ItemEditModal: React.FC<ItemEditModalProps> = ({
               quantity: formData.quantity ?? 1,
               isCnc: formData.isCnc,
               isPieceStock: formData.isPieceStock,
+              manualBilletLength: formData.manualBilletLength ? Number(formData.manualBilletLength) : null,
             });
-            if (!liveBillet.hasLength) return null;
+            if (!liveBillet.hasLength && !formData.manualBilletLength) return null;
             return (
               <div className="p-3 rounded-xl bg-amber-950/20 border border-amber-500/30 text-amber-200 space-y-1.5">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center space-x-2">
                     <Calculator className="w-4 h-4 text-amber-400" />
-                    <span className="font-semibold text-xs text-white">Расчитанная заготовка:</span>
+                    <span className="font-semibold text-xs text-white">
+                      {liveBillet.isManualBillet ? 'Ручная заготовка:' : 'Расчитанная заготовка:'}
+                    </span>
                     <span className="font-mono font-bold text-amber-300">
                       {liveBillet.billetLength} мм
                     </span>
@@ -273,6 +321,30 @@ export const ItemEditModal: React.FC<ItemEditModalProps> = ({
               </div>
             );
           })()}
+
+          {/* Combined Billet Group info */}
+          {formData.combinedBilletGroupId && (
+            <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-between">
+              <div className="flex items-center space-x-2 text-amber-200">
+                <Layers className="w-4 h-4 text-amber-400 shrink-0" />
+                <div>
+                  <div className="font-semibold text-xs text-amber-300">
+                    Объединено в: {formData.combinedBilletName || 'Заготовка'}
+                  </div>
+                  <div className="text-[10px] text-slate-400">
+                    Рассчитывается совместно с остальными деталями группы
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setFormData({ ...formData, combinedBilletGroupId: undefined, combinedBilletName: undefined })}
+                className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-amber-300 text-xs rounded-lg border border-amber-500/40 transition"
+              >
+                Разъединить
+              </button>
+            </div>
+          )}
 
           {/* Quantity & 1C Code row */}
           <div className="grid grid-cols-2 gap-3">

@@ -170,8 +170,10 @@ export async function generateProductionPdfWithQuantities(
     eraseOldDesignation: true,
     offsetX_mm: 0,
     offsetY_mm: 0,
-  }
+  },
+  allContextItems?: DrawingItem[]
 ): Promise<Uint8Array> {
+  const contextItems = (allContextItems && allContextItems.length > 0) ? allContextItems : items;
   let pdfDoc: PDFDocument;
 
   if (pdfBase64 && pdfBase64.length > 100) {
@@ -206,18 +208,13 @@ export async function generateProductionPdfWithQuantities(
       const isEskdBox = options.position === 'top-left-eskd' || options.position === 'top-left';
       const fontSize = isEskdBox ? (options.fontSize || 13) : 22;
 
-      let stampText = '';
-      if (options.format === 'kd-billet') {
-        const billet = calculateBillet(item);
-        if (billet.hasLength && billet.kdString) {
-          stampText = billet.kdString; // Format requested: Lзаг=[расчитанная заготовка]-[кол-во заготовок]
-        } else {
-          stampText = `${item.quantity ?? 1} шт.`;
-        }
-      } else if (options.format === 'with-prefix') {
-        stampText = `Кол-во: ${item.quantity} шт.`;
+      // 1. QUANTITY STAMP (Графа 26 / верхний левый угол)
+      const qtyVal = item.quantity ?? 1;
+      let qtyStampText = '';
+      if (options.format === 'with-prefix') {
+        qtyStampText = `Кол-во: ${qtyVal} шт.`;
       } else {
-        stampText = `${item.quantity} шт.`;
+        qtyStampText = `${qtyVal} шт.`;
       }
 
       // ESKD Графа 26 standard dimensions: ~70 mm x ~14 mm (198.4 pt x 39.7 pt)
@@ -251,8 +248,8 @@ export async function generateProductionPdfWithQuantities(
         vy = 160 + userShiftY;
       }
 
-      // Generate the crisp Arial stamp image with white background (to erase old designation)
-      const stampData = await createArialStampImage(stampText, {
+      // Generate the crisp Arial quantity stamp image with white background (to erase old designation)
+      const qtyStampData = await createArialStampImage(qtyStampText, {
         fontSize,
         fontFamily: options.fontFamily || 'Arial',
         withBorder: options.withBorder,
@@ -262,16 +259,14 @@ export async function generateProductionPdfWithQuantities(
         fixedHeight: isEskdBox ? boxH : undefined,
       });
 
-      const stampImage = await pdfDoc.embedPng(stampData.bytes);
-      const actualW = stampData.width;
-      const actualH = stampData.height;
+      const qtyStampImage = await pdfDoc.embedPng(qtyStampData.bytes);
 
       // Transform Viewer Coordinates to Native Coordinates with rotation compensation
-      const transformed = transformViewerRectToNative(
+      const transformedQty = transformViewerRectToNative(
         vx,
         vy,
-        actualW,
-        actualH,
+        qtyStampData.width,
+        qtyStampData.height,
         rawW,
         rawH,
         rotation,
@@ -279,14 +274,73 @@ export async function generateProductionPdfWithQuantities(
         originY
       );
 
-      // Draw the image (which has solid white background and crisp border, perfectly erasing old text)
-      page.drawImage(stampImage, {
-        x: transformed.x,
-        y: transformed.y,
-        width: transformed.width,
-        height: transformed.height,
-        rotate: transformed.rotate,
+      // Draw the quantity stamp
+      page.drawImage(qtyStampImage, {
+        x: transformedQty.x,
+        y: transformedQty.y,
+        width: transformedQty.width,
+        height: transformedQty.height,
+        rotate: transformedQty.rotate,
       });
+
+      // 2. BILLET LENGTH STAMP (Длина заготовки строго слева от обозначения в рамке)
+      if (options.printBilletStamp !== false) {
+        const billet = calculateBillet(item, contextItems);
+        const billetText = billet.stampText || billet.kdString;
+        if (billet.hasLength && billetText) {
+          // Billet box dimensions: ~59 mm x ~11.5 mm (fits inside 65mm x 15mm zone)
+          const billetBoxW = 168; 
+          const billetBoxH = 32;
+
+          // Standard ESKD Title Block (185mm x 55mm in bottom right corner):
+          // Right margin: 5mm (14.17 pt)
+          // 120mm Designation Box (Графа 2): from vWidth - 5mm - 120mm = vWidth - 354.33 pt to vWidth - 14.17 pt
+          // 185mm Title Block left border: vWidth - 5mm - 185mm = vWidth - 538.58 pt
+          // The area strictly to the left of designation is 65mm wide (184.25 pt), from vWidth - 538.58 pt to vWidth - 354.33 pt.
+          // Center of this 65mm zone: vWidth - 446.45 pt.
+          const billetShiftX = (options.billetOffsetX_mm || 0) * 2.83465;
+          const billetShiftY = (options.billetOffsetY_mm || 0) * 2.83465;
+
+          const billetCenterX = vWidth - 446.45 + billetShiftX;
+          const bvx = billetCenterX - (billetBoxW / 2);
+
+          // Vertically centered in the top 15mm row (40mm to 55mm from bottom):
+          // 5mm bottom margin + 40mm = 127.56 pt.
+          const bvy = 14.17 + (40 * 2.83465) + 3 + billetShiftY; // ~130.5 pt
+
+          const fontSize = billetText.length > 25 ? 9.5 : (billetText.length > 18 ? 10.5 : 11);
+          const billetStampData = await createArialStampImage(billetText, {
+            fontSize,
+            fontFamily: options.fontFamily || 'Arial',
+            withBorder: true,
+            stampColor: options.stampColor || '#000000',
+            bgColor: '#ffffff',
+            fixedWidth: billetBoxW,
+            fixedHeight: billetBoxH,
+          });
+
+          const billetStampImage = await pdfDoc.embedPng(billetStampData.bytes);
+          const transformedBillet = transformViewerRectToNative(
+            bvx,
+            bvy,
+            billetStampData.width,
+            billetStampData.height,
+            rawW,
+            rawH,
+            rotation,
+            originX,
+            originY
+          );
+
+          page.drawImage(billetStampImage, {
+            x: transformedBillet.x,
+            y: transformedBillet.y,
+            width: transformedBillet.width,
+            height: transformedBillet.height,
+            rotate: transformedBillet.rotate,
+          });
+        }
+      }
     }
 
   } else {
@@ -375,27 +429,15 @@ export async function generateProductionPdfWithQuantities(
           height: stampInfo.height,
         });
 
-        // STAMP QUANTITY IN TOP-LEFT ESKD BOX (Графа 26)
+        // STAMP 1: QUANTITY IN TOP-LEFT ESKD BOX (Графа 26)
         const qtyVal = item.quantity ?? 1;
-        let stampText = '';
-        if (options.format === 'kd-billet') {
-          const billet = calculateBillet(item);
-          if (billet.hasLength && billet.kdString) {
-            stampText = billet.kdString;
-          } else {
-            stampText = `${qtyVal} шт.`;
-          }
-        } else if (options.format === 'with-prefix') {
-          stampText = `Кол-во: ${qtyVal} шт.`;
-        } else {
-          stampText = `${qtyVal} шт.`;
-        }
+        const qtyStampText = options.format === 'with-prefix' ? `Кол-во: ${qtyVal} шт.` : `${qtyVal} шт.`;
         const boxW = 198;
         const boxH = 39.7;
         const boxX = leftMargin + ((options.offsetX_mm || 0) * 2.83465);
         const boxY = height - topMargin - boxH + ((options.offsetY_mm || 0) * 2.83465);
 
-        const qtyStamp = await createArialStampImage(stampText, {
+        const qtyStamp = await createArialStampImage(qtyStampText, {
           fontSize: options.fontSize || 13,
           fontFamily: 'Arial',
           withBorder: true,
@@ -412,6 +454,38 @@ export async function generateProductionPdfWithQuantities(
           width: boxW,
           height: boxH,
         });
+
+        // STAMP 2: BILLET LENGTH STRICTLY LEFT OF DESIGNATION
+        if (options.printBilletStamp !== false) {
+          const billet = calculateBillet(item, contextItems);
+          const billetText = billet.stampText || billet.kdString;
+          if (billet.hasLength && billetText) {
+            const billetBoxW = 168;
+            const billetBoxH = 32;
+            const bCenter = width - rightMargin - 432.28 + ((options.billetOffsetX_mm || 0) * 2.83465);
+            const bX = bCenter - (billetBoxW / 2);
+            const bY = bottomMargin + (40 * 2.83465) + 3 + ((options.billetOffsetY_mm || 0) * 2.83465);
+
+            const fontSize = billetText.length > 25 ? 9.5 : (billetText.length > 18 ? 10.5 : 11);
+            const bStamp = await createArialStampImage(billetText, {
+              fontSize,
+              fontFamily: 'Arial',
+              withBorder: true,
+              stampColor: '#000000',
+              bgColor: '#ffffff',
+              fixedWidth: billetBoxW,
+              fixedHeight: billetBoxH,
+            });
+
+            const bImg = await pdfDoc.embedPng(bStamp.bytes);
+            page.drawImage(bImg, {
+              x: bX,
+              y: bY,
+              width: billetBoxW,
+              height: billetBoxH,
+            });
+          }
+        }
       }
     }
   }

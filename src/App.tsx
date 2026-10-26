@@ -4,7 +4,8 @@ import {
   ExtractionProgress,
   SectionType,
   ExcelColumnMapping,
-  BatchSession
+  BatchSession,
+  isRodOrStud
 } from './types';
 import { INITIAL_DEMO_ITEMS, SAMPLE_EXCEL_BOM_ROWS } from './utils/demoData';
 import { Header } from './components/Header';
@@ -36,6 +37,7 @@ export default function App() {
   const [pdfThumbnails, setPdfThumbnails] = useState<Map<number, string>>(new Map());
 
   const [items, setItems] = useState<DrawingItem[]>(INITIAL_DEMO_ITEMS);
+  const [machinesCount, setMachinesCount] = useState<number>(1);
   const [selectedSection, setSelectedSection] = useState<SectionType | 'all'>('all');
   const [currentPdfBase64, setCurrentPdfBase64] = useState<string | undefined>(undefined);
   const [currentPdfName, setCurrentPdfName] = useState<string | undefined>(undefined);
@@ -85,6 +87,9 @@ export default function App() {
         setItems(active.items);
         setCurrentPdfBase64(active.pdfBase64);
         setCurrentPdfName(active.pdfFileName);
+        if (active.machinesCount && active.machinesCount > 0) {
+          setMachinesCount(active.machinesCount);
+        }
         if (active.pdfBase64) {
           generatePdfPageThumbnails(active.pdfBase64, active.id).then(thumbs => {
             setPdfThumbnails(thumbs);
@@ -94,9 +99,15 @@ export default function App() {
     }
   }, []);
 
-  // Sync active session when items change
-  const syncItemsToActiveSession = (newItems: DrawingItem[], pdfName?: string, pdfB64?: string) => {
+  // Sync active session when items or machine count change
+  const syncItemsToActiveSession = (
+    newItems: DrawingItem[],
+    pdfName?: string,
+    pdfB64?: string,
+    newMachinesCount?: number
+  ) => {
     setItems(newItems);
+    const mCount = newMachinesCount !== undefined ? newMachinesCount : machinesCount;
     if (activeSessionId) {
       const active = sessions.find(s => s.id === activeSessionId);
       if (active) {
@@ -104,6 +115,7 @@ export default function App() {
           ...active,
           items: newItems,
           totalQty: newItems.reduce((acc, it) => acc + (it.quantity || 0), 0),
+          machinesCount: mCount,
           pdfFileName: pdfName !== undefined ? pdfName : active.pdfFileName,
           pdfBase64: pdfB64 !== undefined ? pdfB64 : active.pdfBase64,
           updatedAt: new Date().toISOString(),
@@ -112,6 +124,35 @@ export default function App() {
         setSessions(prev => prev.map(s => (s.id === updated.id ? updated : s)));
       }
     }
+  };
+
+  /**
+   * Handle changing the machine count multiplier.
+   * Multiplies the base quantities (per machine) by the target machine count.
+   */
+  const handleMachinesCountChange = (newCount: number) => {
+    const targetCount = Math.max(1, Math.round(newCount));
+    setMachinesCount(targetCount);
+
+    const updated = items.map(it => {
+      // Determine base quantity per 1 machine
+      let perMachine = it.quantityPerMachine;
+      if (perMachine === undefined || perMachine === null) {
+        perMachine = (it.quantity !== null && it.quantity !== undefined)
+          ? Math.max(1, Math.round(it.quantity / (machinesCount || 1)))
+          : null;
+      }
+
+      const totalQty = perMachine !== null ? perMachine * targetCount : null;
+      return {
+        ...it,
+        quantityPerMachine: perMachine,
+        quantity: totalQty,
+      };
+    });
+
+    syncItemsToActiveSession(updated, currentPdfName, currentPdfBase64, targetCount);
+    showToast(`Количество машин изменено на ${targetCount}. Все количества и расчеты заготовок пересчитаны!`, 'info');
   };
 
   // Trigger temporary notification toast
@@ -141,7 +182,7 @@ export default function App() {
 
           setProgress({
             status: 'analyzing_ai',
-            message: 'Gemini анализирует титульные листы разделов и штампы чертежей...',
+            message: 'Нейросеть Gemini анализирует титульные листы 4 разделов и штампы чертежей...',
           });
 
           const res = await fetch('/api/extract-drawings', {
@@ -179,14 +220,7 @@ export default function App() {
               status: 'success',
               message: `Создан новый отбор: ${newTitle}! Извлечено ${data.items.length} чертежей.`,
             });
-            if (data.isDemoFallback) {
-              showToast(
-                data.message || 'Обработано в демонстрационном режиме (ключ Gemini API не настроен).',
-                'info'
-              );
-            } else {
-              showToast(`Создан новый отбор! Извлечено ${data.items.length} чертежей.`, 'success');
-            }
+            showToast(`Создан новый отбор! Извлечено ${data.items.length} чертежей по 4 разделам.`, 'success');
           } else {
             throw new Error('Чертежи не обнаружены в ответе');
           }
@@ -304,6 +338,52 @@ export default function App() {
     showToast(`Для ${ids.length} деталей установлен статус штучной заготовки: ${isPieceStock ? 'Да' : 'Нет'}`, 'success');
   };
 
+  const handleBatchCombineBillet = (ids: string[]) => {
+    if (ids.length < 2) {
+      showToast('Выберите как минимум 2 детали для объединения в одну заготовку', 'info');
+      return;
+    }
+    const idSet = new Set(ids);
+    const grpId = `billet-grp-${Date.now()}`;
+
+    // Count existing combined groups to name consecutively
+    const existingGroups = new Set<string>();
+    items.forEach(it => {
+      if (it.combinedBilletGroupId) existingGroups.add(it.combinedBilletGroupId);
+    });
+    const groupName = `Заготовка №${existingGroups.size + 1}`;
+
+    const next = items.map(it => {
+      if (idSet.has(it.id)) {
+        return {
+          ...it,
+          combinedBilletGroupId: grpId,
+          combinedBilletName: groupName,
+        };
+      }
+      return it;
+    });
+
+    syncItemsToActiveSession(next);
+    showToast(`Позиции (${ids.length} шт) объединены в "${groupName}"`, 'success');
+  };
+
+  const handleBatchUncombineBillet = (ids: string[]) => {
+    const idSet = new Set(ids);
+    const next = items.map(it => {
+      if (idSet.has(it.id)) {
+        return {
+          ...it,
+          combinedBilletGroupId: undefined,
+          combinedBilletName: undefined,
+        };
+      }
+      return it;
+    });
+    syncItemsToActiveSession(next);
+    showToast(`Позиции (${ids.length} шт) исключены из объединенной заготовки`, 'info');
+  };
+
   const handleAddItem = (section?: SectionType) => {
     setEditModalData({
       isOpen: true,
@@ -401,6 +481,8 @@ export default function App() {
         sessionsCount={sessions.length}
         activeSessionTitle={activeSession?.title}
         onOpenGeneratePdf={() => setIsGeneratePdfOpen(true)}
+        machinesCount={machinesCount}
+        onMachinesCountChange={handleMachinesCountChange}
       />
 
       {/* Main Container */}
@@ -439,11 +521,11 @@ export default function App() {
           onExcelSelected={handleExcelSelected}
           onLoadDemo={() => {
             syncItemsToActiveSession(INITIAL_DEMO_ITEMS);
-            showToast('Загружен комплект чертежей (17 деталей в 5 разделах)', 'success');
+            showToast('Загружен комплект чертежей (17 деталей в 4 разделах)', 'success');
           }}
           onApplySampleExcel={handleApplySampleExcel}
           onDownloadTemplate={downloadBlankQuantityTemplate}
-          itemsCount={items.length}
+          itemsCount={items.filter(it => !isRodOrStud(it)).length}
         />
 
         {/* Section Tabs */}
@@ -464,9 +546,12 @@ export default function App() {
           onBatchMoveSection={handleBatchMoveSection}
           onBatchToggleCnc={handleBatchToggleCnc}
           onBatchTogglePieceStock={handleBatchTogglePieceStock}
+          onCombineBillet={handleBatchCombineBillet}
+          onUncombineBillet={handleBatchUncombineBillet}
           onEditModalOpen={(item) => setEditModalData({ isOpen: true, item })}
           onOpenBlueprint={(item) => setBlueprintModalItem(item)}
           pdfThumbnails={pdfThumbnails}
+          machinesCount={machinesCount}
         />
 
       </main>
@@ -478,6 +563,7 @@ export default function App() {
           onClose={() => setBlueprintModalItem(null)}
           item={blueprintModalItem}
           pdfBase64={currentPdfBase64}
+          allItems={items}
         />
       )}
 
@@ -513,6 +599,7 @@ export default function App() {
           currentItems={items}
           initialMapping={excelModalData.mapping}
           onApplyMatches={handleApplyExcelMatches}
+          machinesCount={machinesCount}
         />
       )}
 

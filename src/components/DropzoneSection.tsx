@@ -154,7 +154,7 @@ export const DropzoneSection: React.FC<DropzoneSectionProps> = ({
                     Перетащите <span className="text-blue-400 font-semibold">PDF с чертежами</span> сюда или нажмите для выбора
                   </div>
                   <div className="text-[11px] text-slate-500">
-                    Автоматически разделяет по 5 разделам и извлекает Наименование, Обозначение, Количество
+                    Автоматически разделяет по 4 разделам и извлекает Наименование, Обозначение, Длину детали, ЧПУ, Количество
                   </div>
                 </div>
               )}

@@ -15,7 +15,7 @@ import {
   Cpu,
   AlertTriangle
 } from 'lucide-react';
-import { DrawingItem } from '../types';
+import { DrawingItem, isRodOrStud } from '../types';
 import {
   exportUnifiedExcel,
   exportMultiSheetExcel,
@@ -32,6 +32,8 @@ interface HeaderProps {
   sessionsCount: number;
   activeSessionTitle?: string;
   onOpenGeneratePdf: () => void;
+  machinesCount?: number;
+  onMachinesCountChange?: (count: number) => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -43,15 +45,18 @@ export const Header: React.FC<HeaderProps> = ({
   sessionsCount,
   activeSessionTitle,
   onOpenGeneratePdf,
+  machinesCount = 1,
+  onMachinesCountChange,
 }) => {
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
 
-  const totalQty = items.reduce((sum, it) => sum + (it.quantity || 0), 0);
-  const with1C = items.filter(it => Boolean(it.code1C)).length;
-  const withCnc = items.filter(it => it.isCnc).length;
-  const withoutStamp = items.filter(it => it.hasNoStamp).length;
-  const missingQty = items.filter(it => it.quantity === null || it.quantity === 0).length;
+  const visibleItems = items.filter(it => !isRodOrStud(it));
+  const totalQty = visibleItems.reduce((sum, it) => sum + (it.quantity || 0), 0);
+  const with1C = visibleItems.filter(it => Boolean(it.code1C)).length;
+  const withCnc = visibleItems.filter(it => it.isCnc).length;
+  const withoutStamp = visibleItems.filter(it => it.hasNoStamp).length;
+  const missingQty = visibleItems.filter(it => it.quantity === null || it.quantity === 0).length;
 
   return (
     <header className="bg-slate-900 border-b border-slate-800 text-white sticky top-0 z-30 shadow-md">
@@ -118,8 +123,57 @@ export const Header: React.FC<HeaderProps> = ({
             )}
           </div>
 
-          {/* Top Actions: History, Сформировать ПДФ, Export Excel */}
+          {/* Top Actions: Machine Count, History, Сформировать ПДФ, Export Excel */}
           <div className="flex items-center space-x-2 flex-wrap">
+            {/* Machine Count Multiplier Control */}
+            {onMachinesCountChange && (
+              <div
+                className="flex items-center space-x-1.5 bg-slate-800/95 border border-slate-700/80 px-2.5 py-1.5 rounded-lg shadow-sm"
+                title="Количество машин в плане. Если отчет Excel составлен на 1 машину, количество деталей умножается на это число"
+              >
+                <span className="text-slate-300 text-xs font-semibold flex items-center space-x-1">
+                  <span>Машин в плане:</span>
+                </span>
+                <div className="flex items-center space-x-1">
+                  <button
+                    type="button"
+                    onClick={() => onMachinesCountChange(Math.max(1, machinesCount - 1))}
+                    disabled={machinesCount <= 1}
+                    className="w-5 h-5 bg-slate-700 hover:bg-slate-600 disabled:opacity-40 disabled:hover:bg-slate-700 rounded text-xs text-white font-bold flex items-center justify-center transition"
+                    title="Уменьшить количество машин"
+                  >
+                    -
+                  </button>
+                  <input
+                    type="number"
+                    min="1"
+                    max="999"
+                    value={machinesCount}
+                    onChange={(e) => {
+                      const val = parseInt(e.target.value, 10);
+                      if (!isNaN(val) && val >= 1) {
+                        onMachinesCountChange(val);
+                      }
+                    }}
+                    className="w-10 text-center bg-slate-900 border border-slate-700 rounded text-white font-mono font-bold text-xs py-0.5 focus:outline-none focus:border-blue-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => onMachinesCountChange(machinesCount + 1)}
+                    className="w-5 h-5 bg-slate-700 hover:bg-slate-600 rounded text-xs text-white font-bold flex items-center justify-center transition"
+                    title="Увеличить количество машин"
+                  >
+                    +
+                  </button>
+                </div>
+                {machinesCount > 1 && (
+                  <span className="text-[10px] bg-blue-500/20 text-blue-300 border border-blue-500/40 px-1.5 py-0.5 rounded font-mono font-bold ml-0.5">
+                    ×{machinesCount}
+                  </span>
+                )}
+              </div>
+            )}
+
             {/* History Button */}
             <button
               onClick={onOpenHistory}
@@ -169,7 +223,7 @@ export const Header: React.FC<HeaderProps> = ({
                     Форматы сохранения
                   </div>
                   <button
-                    onClick={() => exportUnifiedExcel(items)}
+                    onClick={() => exportUnifiedExcel(items, 'Спецификация_по_разделам.xlsx', machinesCount)}
                     className="w-full text-left px-3.5 py-2.5 hover:bg-slate-700/60 flex items-start space-x-2.5 text-slate-200 transition"
                   >
                     <TableProperties className="w-4 h-4 text-emerald-400 mt-0.5 shrink-0" />
@@ -182,7 +236,7 @@ export const Header: React.FC<HeaderProps> = ({
                   </button>
 
                   <button
-                    onClick={() => exportMultiSheetExcel(items)}
+                    onClick={() => exportMultiSheetExcel(items, 'Спецификация_по_вкладкам.xlsx', machinesCount)}
                     className="w-full text-left px-3.5 py-2.5 hover:bg-slate-700/60 flex items-start space-x-2.5 text-slate-200 transition"
                   >
                     <Layers className="w-4 h-4 text-blue-400 mt-0.5 shrink-0" />
@@ -195,7 +249,7 @@ export const Header: React.FC<HeaderProps> = ({
                   </button>
 
                   <button
-                    onClick={() => download1CCompatibleExcel(items)}
+                    onClick={() => download1CCompatibleExcel(items, 'Выгрузка_для_1С_Номенклатура.xlsx', machinesCount)}
                     className="w-full text-left px-3.5 py-2.5 hover:bg-slate-700/60 flex items-start space-x-2.5 text-slate-200 transition"
                   >
                     <Database className="w-4 h-4 text-amber-400 mt-0.5 shrink-0" />

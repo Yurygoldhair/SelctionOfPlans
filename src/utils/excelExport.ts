@@ -6,14 +6,17 @@ import { calculateBillet } from './billetCalculator';
  * Exports drawing items in a unified single-sheet manufacturing template
  * with headers for each of the 4 sections, subtotals, and formatted columns.
  */
-export function exportUnifiedExcel(items: DrawingItem[], filename = 'Спецификация_по_разделам.xlsx') {
+export function exportUnifiedExcel(items: DrawingItem[], filename = 'Спецификация_по_разделам.xlsx', machinesCount = 1) {
   const wb = XLSX.utils.book_new();
 
   // Create unified rows array
   const rows: any[][] = [];
 
   // Title header block
-  rows.push(['ЕДИНАЯ СПЕЦИФИКАЦИЯ ИЗДЕЛИЙ ПО РАЗДЕЛАМ ПРОИЗВОДСТВА']);
+  const titleText = machinesCount > 1
+    ? `ЕДИНАЯ СПЕЦИФИКАЦИЯ ИЗДЕЛИЙ ПО РАЗДЕЛАМ ПРОИЗВОДСТВА (ПЛАН НА ${machinesCount} МАШ.)`
+    : 'ЕДИНАЯ СПЕЦИФИКАЦИЯ ИЗДЕЛИЙ ПО РАЗДЕЛАМ ПРОИЗВОДСТВА';
+  rows.push([titleText]);
   rows.push([`Дата формирования: ${new Date().toLocaleDateString('ru-RU')} ${new Date().toLocaleTimeString('ru-RU')}`]);
   rows.push(['']); // Blank separator
 
@@ -35,52 +38,76 @@ export function exportUnifiedExcel(items: DrawingItem[], filename = 'Специ�
     rows.push([sectionBanner]);
 
     // Table Header Row
-    rows.push([
+    const headerRow = [
       '№ п/п',
       'Наименование',
       'Обозначение / Опознано',
       'Длина детали (мм)',
       'ЧПУ',
       'Штучная заготовка',
+      'Объединенная заготовка',
       'Длина заготовки (мм)',
       'Формат КД (Lзаг)',
-      'Количество (шт)',
+    ];
+    if (machinesCount > 1) {
+      headerRow.push('Кол-во на 1 маш.');
+      headerRow.push(`Всего шт. (${machinesCount} маш.)`);
+    } else {
+      headerRow.push('Количество (шт)');
+    }
+    headerRow.push(
       'Код по 1С (для стандартов)',
       'Материал',
       'Лист PDF',
-      'Примечание / Опознавательный знак',
-    ]);
+      'Примечание / Опознавательный знак'
+    );
+    rows.push(headerRow);
 
     if (sectionItems.length === 0) {
-      rows.push(['—', 'Позиции отсутствуют', '—', '—', '—', '—', '—', '—', 0, '—', '—', '—', '']);
+      const emptyRow = ['—', 'Позиции отсутствуют', '—', '—', '—', '—', '—', '—', '—'];
+      if (machinesCount > 1) emptyRow.push('—', '0');
+      else emptyRow.push('0');
+      emptyRow.push('—', '—', '—', '');
+      rows.push(emptyRow);
     } else {
       sectionItems.forEach((item, itemIdx) => {
         const desigText = item.hasNoStamp && item.identificationMark
           ? `[Без рамки] ${item.identificationMark}`
           : item.designation;
 
-        const billet = calculateBillet(item);
+        const billet = calculateBillet(item, items);
+        const kdCellText = billet.stampText || billet.kdString || '';
 
-        rows.push([
+        const row: any[] = [
           itemIdx + 1,
           item.name,
           desigText,
           item.partLength || '',
           item.isCnc ? 'Да' : 'Нет',
           item.isPieceStock ? 'Да' : 'Нет',
+          item.combinedBilletName || (item.combinedBilletGroupId ? 'Да' : 'Нет'),
           billet.billetLength ?? '',
-          billet.kdString || '',
-          item.quantity ?? '',
+          kdCellText,
+        ];
+        if (machinesCount > 1) {
+          const perMach = item.quantityPerMachine ?? (item.quantity !== null && item.quantity !== undefined ? Math.round(item.quantity / machinesCount) : '');
+          row.push(perMach);
+          row.push(item.quantity ?? '');
+        } else {
+          row.push(item.quantity ?? '');
+        }
+        row.push(
           item.code1C || '',
           item.material || '',
           item.pageNumber ? `Лист ${item.pageNumber}` : '',
           item.notes || (item.hasNoStamp ? 'Найден опознавательный знак на эскизе' : ''),
-        ]);
+        );
+        rows.push(row);
       });
     }
 
     // Subtotal Row
-    rows.push([
+    const subtotalRow: any[] = [
       '',
       `ИТОГО ПО РАЗДЕЛУ "${sectionName}":`,
       `${sectionItems.length} поз.`,
@@ -89,17 +116,20 @@ export function exportUnifiedExcel(items: DrawingItem[], filename = 'Специ�
       '',
       '',
       '',
-      sectionTotalQty,
       '',
-      '',
-      '',
-      '',
-    ]);
+    ];
+    if (machinesCount > 1) {
+      subtotalRow.push('');
+      subtotalRow.push(sectionTotalQty);
+    } else {
+      subtotalRow.push(sectionTotalQty);
+    }
+    rows.push(subtotalRow);
     rows.push(['']); // Empty separator between sections
   });
 
   // Grand Total Summary
-  rows.push([
+  const grandTotalRow: any[] = [
     '',
     'ИТОГО ПО ВСЕМ РАЗДЕЛАМ ПРОИЗВОДСТВА:',
     `${grandTotalItems} позиций`,
@@ -108,12 +138,15 @@ export function exportUnifiedExcel(items: DrawingItem[], filename = 'Специ�
     '',
     '',
     '',
-    grandTotalQty,
     '',
-    '',
-    '',
-    '',
-  ]);
+  ];
+  if (machinesCount > 1) {
+    grandTotalRow.push('');
+    grandTotalRow.push(grandTotalQty);
+  } else {
+    grandTotalRow.push(grandTotalQty);
+  }
+  rows.push(grandTotalRow);
 
   const ws = XLSX.utils.aoa_to_sheet(rows);
 
@@ -126,8 +159,9 @@ export function exportUnifiedExcel(items: DrawingItem[], filename = 'Специ�
     { wch: 8 },  // ЧПУ
     { wch: 16 }, // Штучная заготовка
     { wch: 20 }, // Длина заготовки (мм)
-    { wch: 18 }, // Формат КД (Lзаг)
+    { wch: 28 }, // Формат КД (Lзаг)
     { wch: 16 }, // Количество
+    { wch: 16 }, // Доп. кол-во при >1 машин
     { wch: 24 }, // Код по 1С
     { wch: 24 }, // Материал
     { wch: 12 }, // Лист PDF
@@ -141,13 +175,16 @@ export function exportUnifiedExcel(items: DrawingItem[], filename = 'Специ�
 /**
  * Exports to an Excel workbook with 4 separate tabs (one for each section) + a Summary tab
  */
-export function exportMultiSheetExcel(items: DrawingItem[], filename = 'Спецификация_по_вкладкам.xlsx') {
+export function exportMultiSheetExcel(items: DrawingItem[], filename = 'Спецификация_по_вкладкам.xlsx', machinesCount = 1) {
   const wb = XLSX.utils.book_new();
 
   // 1. Summary sheet
+  const summaryTitle = machinesCount > 1
+    ? `СВОДНАЯ ВЕДОМОСТЬ ПО РАЗДЕЛАМ ПРОИЗВОДСТВА (ПЛАН НА ${machinesCount} МАШ.)`
+    : 'СВОДНАЯ ВЕДОМОСТЬ ПО РАЗДЕЛАМ ПРОИЗВОДСТВА';
   const summaryRows: any[][] = [
-    ['СВОДНАЯ ВЕДОМОСТЬ ПО РАЗДЕЛАМ ПРОИЗВОДСТВА'],
-    ['Раздел производства', 'Количество позиций', 'ЧПУ (поз.)', 'Суммарное количество (шт)', 'Заполнено кодов 1С'],
+    [summaryTitle],
+    ['Раздел производства', 'Количество позиций', 'ЧПУ (поз.)', machinesCount > 1 ? `Суммарно шт (${machinesCount} маш.)` : 'Суммарное количество (шт)', 'Заполнено кодов 1С'],
   ];
 
   let totalPos = 0;
@@ -174,28 +211,33 @@ export function exportMultiSheetExcel(items: DrawingItem[], filename = 'Спец
   // 2. Individual section sheets
   SECTIONS.forEach((sectionName) => {
     const secItems = items.filter(it => it.section === sectionName);
+    const secHeaderRow = [
+      '№',
+      'Наименование',
+      'Обозначение',
+      'Длина детали (мм)',
+      'ЧПУ',
+      'Штучная заготовка',
+      'Длина заготовки (мм)',
+      'Формат КД (Lзаг)',
+    ];
+    if (machinesCount > 1) {
+      secHeaderRow.push('Кол-во на 1 маш.');
+      secHeaderRow.push(`Всего шт. (${machinesCount} маш.)`);
+    } else {
+      secHeaderRow.push('Количество (шт)');
+    }
+    secHeaderRow.push('Код по 1С', 'Материал', 'Лист PDF', 'Примечание');
+
     const secRows: any[][] = [
-      [`РАЗДЕЛ: ${sectionName.toUpperCase()}`],
-      [
-        '№',
-        'Наименование',
-        'Обозначение',
-        'Длина детали (мм)',
-        'ЧПУ',
-        'Штучная заготовка',
-        'Длина заготовки (мм)',
-        'Формат КД (Lзаг)',
-        'Количество (шт)',
-        'Код по 1С',
-        'Материал',
-        'Лист PDF',
-        'Примечание',
-      ],
+      [`РАЗДЕЛ: ${sectionName.toUpperCase()}${machinesCount > 1 ? ` (ПЛАН НА ${machinesCount} МАШ.)` : ''}`],
+      secHeaderRow,
     ];
 
     secItems.forEach((item, idx) => {
-      const billet = calculateBillet(item);
-      secRows.push([
+      const billet = calculateBillet(item, items);
+      const kdCellText = billet.stampText || billet.kdString || '';
+      const r: any[] = [
         idx + 1,
         item.name,
         item.hasNoStamp && item.identificationMark ? `[Без рамки] ${item.identificationMark}` : item.designation,
@@ -203,13 +245,22 @@ export function exportMultiSheetExcel(items: DrawingItem[], filename = 'Спец
         item.isCnc ? 'Да' : 'Нет',
         item.isPieceStock ? 'Да' : 'Нет',
         billet.billetLength ?? '',
-        billet.kdString || '',
-        item.quantity ?? '',
+        kdCellText,
+      ];
+      if (machinesCount > 1) {
+        const perMach = item.quantityPerMachine ?? (item.quantity !== null && item.quantity !== undefined ? Math.round(item.quantity / machinesCount) : '');
+        r.push(perMach);
+        r.push(item.quantity ?? '');
+      } else {
+        r.push(item.quantity ?? '');
+      }
+      r.push(
         item.code1C || '',
         item.material || '',
         item.pageNumber ? `Лист ${item.pageNumber}` : '',
         item.notes || '',
-      ]);
+      );
+      secRows.push(r);
     });
 
     const secWs = XLSX.utils.aoa_to_sheet(secRows);
@@ -221,8 +272,9 @@ export function exportMultiSheetExcel(items: DrawingItem[], filename = 'Спец
       { wch: 8 },
       { wch: 16 },
       { wch: 20 },
-      { wch: 18 },
+      { wch: 28 },
       { wch: 16 },
+      { wch: 18 },
       { wch: 20 },
       { wch: 22 },
       { wch: 12 },
@@ -243,30 +295,33 @@ export function exportMultiSheetExcel(items: DrawingItem[], filename = 'Спец
 /**
  * Exports in 1C-Enterprise ERP compatible format (tab-delimited or structured Excel)
  */
-export function download1CCompatibleExcel(items: DrawingItem[], filename = 'Выгрузка_для_1С_Номенклатура.xlsx') {
+export function download1CCompatibleExcel(items: DrawingItem[], filename = 'Выгрузка_для_1С_Номенклатура.xlsx', machinesCount = 1) {
   const wb = XLSX.utils.book_new();
 
-  const rows: any[][] = [
-    [
-      'КодНоменклатуры1С',
-      'Артикул / Обозначение',
-      'НаименованиеПолное',
-      'ДлинаДетали',
-      'ЧПУ',
-      'ШтучнаяЗаготовка',
-      'ДлинаЗаготовки',
-      'ОбозначениеКД_Lзаг',
-      'Количество',
-      'ЕдиницаИзмерения',
-      'РазделПроизводства',
-      'Материал',
-      'Примечание',
-    ],
+  const header = [
+    'КодНоменклатуры1С',
+    'Артикул / Обозначение',
+    'НаименованиеПолное',
+    'ДлинаДетали',
+    'ЧПУ',
+    'ШтучнаяЗаготовка',
+    'ДлинаЗаготовки',
+    'ОбозначениеКД_Lзаг',
   ];
+  if (machinesCount > 1) {
+    header.push('КолВоНа1Маш');
+    header.push(`ВсегоШт_${machinesCount}Маш`);
+  } else {
+    header.push('Количество');
+  }
+  header.push('ЕдиницаИзмерения', 'РазделПроизводства', 'Материал', 'Примечание');
+
+  const rows: any[][] = [header];
 
   items.forEach((it) => {
-    const billet = calculateBillet(it);
-    rows.push([
+    const billet = calculateBillet(it, items);
+    const kdCellText = billet.stampText || billet.kdString || '';
+    const r: any[] = [
       it.code1C || '',
       it.designation,
       it.name,
@@ -274,13 +329,22 @@ export function download1CCompatibleExcel(items: DrawingItem[], filename = 'Вы
       it.isCnc ? '1' : '0',
       it.isPieceStock ? '1' : '0',
       billet.billetLength ?? '',
-      billet.kdString || '',
-      it.quantity ?? 1,
+      kdCellText,
+    ];
+    if (machinesCount > 1) {
+      const perMach = it.quantityPerMachine ?? (it.quantity !== null && it.quantity !== undefined ? Math.round(it.quantity / machinesCount) : '');
+      r.push(perMach);
+      r.push(it.quantity ?? 1);
+    } else {
+      r.push(it.quantity ?? 1);
+    }
+    r.push(
       'шт',
       it.section,
       it.material || '',
       it.notes || (it.hasNoStamp ? 'Опознано по знаку на чертеже' : ''),
-    ]);
+    );
+    rows.push(r);
   });
 
   const ws = XLSX.utils.aoa_to_sheet(rows);
@@ -293,7 +357,11 @@ export function download1CCompatibleExcel(items: DrawingItem[], filename = 'Вы
     { wch: 12 },
     { wch: 10 },
     { wch: 30 },
+    { wch: 14 },
+    { wch: 16 },
+    { wch: 8 },
     { wch: 22 },
+    { wch: 20 },
     { wch: 35 },
   ];
 

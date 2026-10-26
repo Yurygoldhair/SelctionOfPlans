@@ -6,7 +6,7 @@ import {
   PackageCheck,
   LayoutGrid
 } from 'lucide-react';
-import { SECTIONS, SectionType, DrawingItem } from '../types';
+import { SECTIONS, SectionType, DrawingItem, isRodOrStud } from '../types';
 
 interface SectionTabsProps {
   selectedSection: SectionType | 'all';
@@ -19,13 +19,15 @@ export const SectionTabs: React.FC<SectionTabsProps> = ({
   onSelectSection,
   items,
 }) => {
+  const visibleItems = items.filter(it => !isRodOrStud(it));
+
   const getSectionStats = (sec: SectionType) => {
-    const secItems = items.filter(it => it.section === sec);
+    const secItems = visibleItems.filter(it => it.section === sec);
     const qty = secItems.reduce((acc, it) => acc + (it.quantity || 0), 0);
     return { count: secItems.length, qty };
   };
 
-  const allQty = items.reduce((acc, it) => acc + (it.quantity || 0), 0);
+  const allQty = visibleItems.reduce((acc, it) => acc + (it.quantity || 0), 0);
 
   const getSectionIcon = (sec: SectionType) => {
     switch (sec) {

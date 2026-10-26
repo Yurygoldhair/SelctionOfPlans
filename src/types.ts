@@ -22,6 +22,11 @@ export interface DrawingItem {
   partLength?: string;       // Длина детали из PDF (например "180 мм", "350", "L=240 мм")
   isCnc?: boolean;           // ЧПУ (обработка на станках с ЧПУ)
   isPieceStock?: boolean;    // Штучная заготовка (расчет исходя из 1 шт, без +30мм при ЧПУ)
+  combinedBilletGroupId?: string; // ID группы объединенной заготовки
+  combinedBilletName?: string;    // Название группы объединенной заготовки, например "Заготовка №1"
+  manualBilletLength?: number | null; // Ручная длина заготовки (мм), переопределяет расчетную
+  manualKdString?: string | null;     // Ручная строка обозначения заготовки в КД
+  quantityPerMachine?: number | null; // Количество на 1 машину
   pageNumber?: number;       // Номер листа/страницы в PDF
   isHighlighted?: boolean;   // Выделенная позиция
   hasNoStamp?: boolean;      // Чертеж без рамки и штампа (опознан по знаку/эскизу)
@@ -29,8 +34,32 @@ export interface DrawingItem {
   notes?: string;            // Примечание / тех. требования
   qtySource?: 'drawing' | 'excel' | 'manual' | 'missing'; // Источник количества
   originalDrawingQty?: number | null; // Исходное количество из чертежа (для сравнения)
+  isRodOrStud?: boolean;    // Пруток или шпилька (НЕ отображается в таблице деталей, но сохраняется для формирования PDF)
   drawingImage?: string;     // URL или base64 чертежа
   previewType?: 'shaft' | 'bushing' | 'plate' | 'precision' | 'rod' | 'fastener' | 'custom';
+}
+
+/**
+ * Robust check if item is a rod (пруток) or stud (шпилька).
+ * These must be excluded from the machined parts table, but preserved for PDF package generation!
+ */
+export function isRodOrStud(it: any): boolean {
+  if (!it) return false;
+  if (it.isRodOrStud === true) return true;
+  const n = String(it.name || '').toLowerCase();
+  const d = String(it.designation || '').toLowerCase();
+  const s = String(it.section || '').toLowerCase();
+  const notes = String(it.notes || '').toLowerCase();
+  return (
+    n.includes('прут') ||
+    n.includes('шпильк') ||
+    d.includes('прут') ||
+    d.includes('шпильк') ||
+    s.includes('прут') ||
+    s.includes('шпильк') ||
+    notes.includes('прут') ||
+    notes.includes('шпильк')
+  );
 }
 
 export interface BatchSession {
@@ -43,6 +72,7 @@ export interface BatchSession {
   excelFileName?: string;    // Имя загруженного Excel с количествами
   items: DrawingItem[];      // Позиции отбора
   totalQty: number;          // Суммарное количество шт.
+  machinesCount?: number;    // Количество машин в плане
   notes?: string;            // Примечание к отбору
 }
 
@@ -54,8 +84,11 @@ export interface StampOptions {
   withBorder: boolean;                // Рамка вокруг количества
   stampColor: string;                 // e.g. '#000000' or '#1e3a8a'
   eraseOldDesignation?: boolean;      // Очистить/закрасить дубликат обозначения в левом верхнем углу
-  offsetX_mm?: number;                // Смещение X в мм (+ вправо, - влево)
-  offsetY_mm?: number;                // Смещение Y в мм (+ вверх, - вниз)
+  offsetX_mm?: number;                // Смещение X количества в мм (+ вправо, - влево)
+  offsetY_mm?: number;                // Смещение Y количества в мм (+ вверх, - вниз)
+  printBilletStamp?: boolean;         // Печатать ли длину заготовки слева от обозначения в рамке
+  billetOffsetX_mm?: number;          // Смещение X заготовки слева от обозначения (мм)
+  billetOffsetY_mm?: number;          // Смещение Y заготовки слева от обозначения (мм)
 }
 
 export interface ExcelColumnMapping {
@@ -79,9 +112,11 @@ export interface ExcelMatchResult {
     item: DrawingItem;
     oldQty: number | null;
     newQty: number;
-    matchType: 'designation' | 'name';
+    matchType: 'designation' | 'name' | 'desig_root';
     matchedRow: Record<string, any>;
     code1CFound?: string;
+    sumRowCount?: number;
+    sumDetails?: string;
   }>;
 }
 

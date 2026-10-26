@@ -16,77 +16,14 @@ const PORT = Number(process.env.PORT) || 3000;
 app.use(express.json({ limit: '50mb' }));
 
 // Initialize GoogleGenAI client (Server-side only)
-// Note: apiKey is intentionally optional here. If GEMINI_API_KEY is missing we
-// still create the client, but every AI call is guarded below and falls back to
-// demo data instead of throwing "API key not found" errors.
 const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY || '',
+  apiKey: process.env.GEMINI_API_KEY,
   httpOptions: {
     headers: {
       'User-Agent': 'aistudio-build',
     },
   },
 });
-
-// Candidate Gemini models, tried in order. The first non-404 model wins.
-// This makes the app resilient when a specific model name (e.g. a preview
-// model like 'gemini-3.8-flash') is not available for the current API key —
-// a wrong/unavailable model name was the cause of "Не удалось проанализировать PDF чертежи".
-const MODEL_CANDIDATES = [
-  process.env.GEMINI_MODEL,
-  'gemini-3.8-flash',
-  'gemini-2.5-flash',
-  'gemini-2.0-flash',
-].filter((m): m is string => Boolean(m));
-
-/**
- * Calls Gemini with the given prompt/PDF, trying candidate models until one works.
- */
-async function generateWithModelFallback(
-  contents: any,
-  config: any
-): Promise<string> {
-  let lastError: any = null;
-
-  for (const model of MODEL_CANDIDATES) {
-    try {
-      const response = await ai.models.generateContent({
-        model,
-        contents,
-        config,
-      });
-      const text = response.text;
-      if (!text) {
-        throw new Error(`Модель ${model} вернула пустой ответ`);
-      }
-      if (model !== MODEL_CANDIDATES[0]) {
-        console.log(`Gemini model "${model}" used (primary model unavailable).`);
-      }
-      return text;
-    } catch (error: any) {
-      lastError = error;
-      const status = error?.status ?? error?.response?.status;
-      const msg = String(error?.message || error);
-      console.error(`Gemini model "${model}" failed (status ${status}): ${msg}`);
-
-      // Only fall through to the next model on model-not-found / permission /
-      // unsupported errors. Other errors (network, payload size, etc.) are
-      // unlikely to be fixed by switching models, but trying the next one is
-      // still safer than crashing outright.
-      const isModelIssue =
-        status === 404 ||
-        status === 400 && /model|not found|unsupported/i.test(msg) ||
-        /not found|no such model|unsupported/i.test(msg);
-
-      if (!isModelIssue && status && status < 500 && status !== 408 && status !== 429) {
-        // 401/403 — bad API key, retrying with another model is pointless
-        if (status === 401 || status === 403) break;
-      }
-    }
-  }
-
-  throw lastError || new Error('Все модели Gemini недоступны');
-}
 
 app.get('/api/health', (req, res) => {
   res.json({
@@ -120,14 +57,26 @@ app.post('/api/extract-drawings', async (req, res) => {
     const systemInstruction = `Ты — ведущий инженер-технолог и нормоконтролер машиностроительного производства.
 Твоя задача — детально проанализировать предоставленный многостраничный PDF-документ с чертежами и титульными листами разделов.
 
-СТРУКТУРА ДОКУМЕНТА И 4 РАЗДЕЛА:
-В документе перед группами чертежей располагаются титульные листы (разделители) 4 производственных разделов:
-1. "Токарные+фрезерные работы"
-2. "Токарные+фрезерные работы: Лазер"
-3. "Токарные+фрезерные работы: ВОС"
-4. "Стандарты" (крепеж и стандартные изделия: ГОСТ, ОСТ, DIN, ISO, винты, болты, гайки, шайбы, подшипники, уплотнения с кодами 1С)
+СТРУКТУРА ДОКУМЕНТА И ОТСЛЕЖИВАНИЕ РАЗДЕЛОВ ПО ТИТУЛЬНЫМ ЛИСТАМ:
+В производственном комплекте могут присутствовать НЕ ВСЕ разделы (например, могут быть только 'Токарные+фрезерные работы' и 'Стандарты', а 'Лазер' или 'ВОС' отсутствовать).
+СТРОГО отслеживай структуру документа последовательно страница за страницей от 1 до конца:
+1. Каждый раз, когда на странице встречается титульный лист / разделитель конкретного раздела:
+   - "Токарные+фрезерные работы"
+   - "Токарные+фрезерные работы: Лазер"
+   - "Токарные+фрезерные работы: ВОС"
+   - "Стандарты" (крепеж и стандартные изделия: ГОСТ, ОСТ, DIN, ISO, винты, болты, гайки, шайбы, подшипники, уплотнения с кодами 1С)
+   ВСЕ последующие чертежи на следующих страницах ОБЯЗАТЕЛЬНО относятся ИСКЛЮЧИТЕЛЬНО к этому разделу, пока не встретится следующий титульный лист!
+2. Если какой-то раздел в PDF отсутствует — НИ В КОЕМ СЛУЧАЕ не придумывай его и не вноси в него детали. Детали должны попадать строго под свой реальный титульник.
 
-Чертежи, идущие после соответствующего титульного листа раздела, принадлежат этому разделу.
+СТРОЖАЙШЕЕ ТРЕБОВАНИЕ — НЕ ВКЛЮЧАТЬ ТИТУЛЬНЫЕ ЛИСТЫ В СПИСОК ДЕТАЛЕЙ:
+НИ В КОЕМ СЛУЧАЕ НЕ создавай элементы в массиве items для самих титульных листов / обложек / разделителей (страницы с надписями 'Токарные+фрезерные работы', 'Лазер', 'ВОС', 'Стандарты', 'Раздел 1', 'Титульный лист' и т.д.).
+Титульные листы служат ИСКЛЮЧИТЕЛЬНО для определения того, к какому разделу относятся последующие чертежи!
+
+ПРУТКИ И ШПИЛЬКИ (НЕ ВНОСИТЬ В ТАБЛИЦУ):
+Если в PDF файле есть титульный лист или позиции "Прутки и шпильки" (или "Прутки", "Шпильки", мерный сортовой прокат):
+СТРОГО НЕ ДОБАВЛЯЙ их в массив items! Эти страницы остаются в самом PDF файле при формировании комплекта, но в таблицу механических деталей не заносятся.
+
+В массив items должны попадать ТОЛЬКО реальные чертежи деталей, эскизы и стандартные изделия!
 
 ДЛЯ КАЖДОГО ЧЕРТЕЖА / ПОЗИЦИИ ИЗВЛЕКИ:
 - name: "Наименование" (графа 1 основной надписи чертежа по ГОСТ 2.104, например 'Втулка упорная', 'Вал приводной', 'Пластина опорная', 'Болт М8х25')
@@ -138,7 +87,7 @@ app.post('/api/extract-drawings', async (req, res) => {
 - isCnc: булево значение true / false (ЧПУ):
   * true — если на чертеже есть отметки ЧПУ, CNC, токарно-фрезерная с ЧПУ, 3D криволинейный контур, фрезеровка карманов со сложной геометрией, высокая точность обработки
   * false — если обычная обработка на универсальных станках или стандарты
-- section: строго одно из 4 названий:
+- section: строго точное название раздела из найденного титульного листа:
   * "Токарные+фрезерные работы"
   * "Токарные+фрезерные работы: Лазер"
   * "Токарные+фрезерные работы: ВОС"
@@ -183,11 +132,16 @@ app.post('/api/extract-drawings', async (req, res) => {
   ]
 }`;
 
-    const promptText = `Пожалуйста, проанализируй загруженный PDF-файл "${fileName || 'чертежи.pdf'}" и извлеки все детали по 4 производственным разделам (Токарные+фрезерные работы, Токарные+фрезерные работы: Лазер, Токарные+фрезерные работы: ВОС, Стандарты).
-Для каждой детали обязательно извлеки:
-1. "partLength" (Длину детали из размеров чертежа: L, длина вала/прутка/пластины).
-2. "isCnc" (Чекбокс ЧПУ: true если деталь требует обработки на ЧПУ).
-3. Если на чертеже нет рамки и нет штампа — найди любой опознавательный знак (маркировку, номер позиции, габарит эскиза) и внеси в designation с флагом hasNoStamp: true.
+    const promptText = `Пожалуйста, проанализируй загруженный PDF-файл "${fileName || 'чертежи.pdf'}".
+ВНИМАНИЕ: В файле могут быть не все разделы (например, только "Токарные+фрезерные работы" и "Стандарты").
+СТРОГО отслеживай последовательно по страницам, под каким именно титульником находятся детали, и вноси их именно в тот раздел!
+ВАЖНЕЙШИЕ ПРАВИЛА:
+1. Титульные листы разделов (страницы с названиями разделов) НЕ ДОБАВЛЯЙ в список деталей items!
+2. "Прутки и шпильки" (титульные листы или позиции шпилек/прутков) НЕ ДОБАВЛЯЙ в массив items! Они остаются в исходном PDF, но в таблицу деталей не заносятся.
+3. Для каждой детали обязательно извлеки:
+   - "partLength" (Длину детали из размеров чертежа: L, длина вала/втулки/пластины в мм).
+   - "isCnc" (Чекбокс ЧПУ: true если деталь требует обработки на ЧПУ).
+4. Если на чертеже нет рамки и нет штампа — найди любой опознавательный знак (маркировку, номер позиции, габарит эскиза) и внеси в designation с флагом hasNoStamp: true.
 Для стандартов извлеки код 1С.`;
 
     const pdfPart = {
@@ -197,38 +151,21 @@ app.post('/api/extract-drawings', async (req, res) => {
       },
     };
 
-    let responseText: string;
-    try {
-      responseText = await generateWithModelFallback(
-        {
-          parts: [
-            pdfPart,
-            { text: promptText },
-          ],
-        },
-        {
-          systemInstruction,
-          responseMimeType: 'application/json',
-        }
-      );
-    } catch (aiError: any) {
-      const status = aiError?.status ?? aiError?.response?.status;
-      const msg = String(aiError?.message || aiError);
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: {
+        parts: [
+          pdfPart,
+          { text: promptText },
+        ],
+      },
+      config: {
+        systemInstruction,
+        responseMimeType: 'application/json',
+      },
+    });
 
-      // If the API key is invalid/missing or no model is available, fall back
-      // to demo data instead of showing a hard error to the user.
-      if (status === 401 || status === 403 || /api.?key/i.test(msg)) {
-        console.warn('Gemini API key is missing or invalid. Returning demo fallback data.');
-        return res.json({
-          success: true,
-          isDemoFallback: true,
-          message: 'Ключ Gemini API не настроен или недействителен — обработано в демонстрационном режиме.',
-          items: getFallbackDemoItems(),
-        });
-      }
-      throw new Error(`Ошибка Gemini API: ${msg}`);
-    }
-
+    const responseText = response.text || '{}';
     let parsedData: any;
     try {
       parsedData = JSON.parse(responseText);
@@ -244,25 +181,47 @@ app.post('/api/extract-drawings', async (req, res) => {
 
     const rawItems = Array.isArray(parsedData.items) ? parsedData.items : [];
 
+    // Filter out title sheets and cover pages (e.g. section dividers)
+    const realRawItems = rawItems.filter((item: any) => !isTitleOrCoverSheet(item));
+
     // Map and sanitize items
-    const formattedItems = rawItems.map((item: any, idx: number) => ({
-      id: `ext-${Date.now()}-${idx}`,
-      name: item.name || `Деталь поз. ${idx + 1}`,
-      designation: item.designation || (item.identificationMark ? `Опознано: ${item.identificationMark}` : `Чертеж без номера (лист ${item.pageNumber || idx + 1})`),
-      quantity: typeof item.quantity === 'number' ? item.quantity : null,
-      code1C: item.code1C || '',
-      partLength: item.partLength ? String(item.partLength) : '',
-      isCnc: Boolean(item.isCnc),
-      isPieceStock: Boolean(item.isPieceStock),
-      hasNoStamp: Boolean(item.hasNoStamp || (!item.designation && item.identificationMark)),
-      identificationMark: item.identificationMark || '',
-      section: sanitizeSection(item.section),
-      material: item.material || '',
-      pageNumber: typeof item.pageNumber === 'number' ? item.pageNumber : (idx + 1),
-      isHighlighted: Boolean(item.isHighlighted),
-      notes: item.notes || '',
-      qtySource: typeof item.quantity === 'number' ? 'drawing' : 'missing',
-    }));
+    const formattedItems = realRawItems.map((item: any, idx: number) => {
+      const name = item.name || `Деталь поз. ${idx + 1}`;
+      const des = item.designation || (item.identificationMark ? `Опознано: ${item.identificationMark}` : `Чертеж без номера (лист ${item.pageNumber || idx + 1})`);
+      const notes = item.notes || '';
+      const sec = sanitizeSection(item.section);
+
+      const isRod = (
+        name.toLowerCase().includes('прут') ||
+        name.toLowerCase().includes('шпильк') ||
+        des.toLowerCase().includes('прут') ||
+        des.toLowerCase().includes('шпильк') ||
+        notes.toLowerCase().includes('прут') ||
+        notes.toLowerCase().includes('шпильк') ||
+        sec.toLowerCase().includes('прут') ||
+        sec.toLowerCase().includes('шпильк')
+      );
+
+      return {
+        id: `ext-${Date.now()}-${idx}`,
+        name,
+        designation: des,
+        quantity: typeof item.quantity === 'number' ? item.quantity : null,
+        code1C: item.code1C || '',
+        partLength: item.partLength ? String(item.partLength) : '',
+        isCnc: Boolean(item.isCnc),
+        isPieceStock: Boolean(item.isPieceStock),
+        isRodOrStud: Boolean(isRod),
+        hasNoStamp: Boolean(item.hasNoStamp || (!item.designation && item.identificationMark)),
+        identificationMark: item.identificationMark || '',
+        section: sec,
+        material: item.material || '',
+        pageNumber: typeof item.pageNumber === 'number' ? item.pageNumber : (idx + 1),
+        isHighlighted: Boolean(item.isHighlighted),
+        notes,
+        qtySource: typeof item.quantity === 'number' ? 'drawing' : 'missing',
+      };
+    });
 
     return res.json({
       success: true,
@@ -272,22 +231,9 @@ app.post('/api/extract-drawings', async (req, res) => {
     });
   } catch (error: any) {
     console.error('Error in /api/extract-drawings:', error);
-
-    // Network-level errors from the AI SDK (DNS/proxy/sandbox restrictions):
-    // e.g. "getaddrinfo EAI_AGAIN", "fetch failed", timeouts — fall back to demo mode
-    const msg = String(error?.message || error);
-    if (/EAI_AGAIN|ENOTFOUND|fetch failed|network|timeout|ETIMEDOUT|ECONNREFUSED|socket hang up/i.test(msg)) {
-      console.warn('Network error reaching Gemini API. Returning demo fallback data.');
-      return res.json({
-        success: true,
-        isDemoFallback: true,
-        message: 'Нет доступа к Gemini API из текущей среды — обработано в демонстрационном режиме.',
-        items: getFallbackDemoItems(),
-      });
-    }
-
+    const msg = error?.message || String(error);
     res.status(500).json({
-      error: 'Не удалось проанализировать PDF чертежи',
+      error: `Ошибка при обработке PDF: ${msg}`,
       details: msg,
     });
   }
@@ -300,6 +246,44 @@ function sanitizeSection(rawSection: string): string {
   if (s.includes('вос')) return 'Токарные+фрезерные работы: ВОС';
   if (s.includes('стандарт') || s.includes('гост') || s.includes('din') || s.includes('крепеж')) return 'Стандарты';
   return 'Токарные+фрезерные работы';
+}
+
+function isTitleOrCoverSheet(item: any): boolean {
+  if (!item) return true;
+  const name = String(item.name || '').trim().toLowerCase();
+  const des = String(item.designation || '').trim().toLowerCase();
+  const notes = String(item.notes || '').trim().toLowerCase();
+
+  // Obvious keywords marking title or cover sheets
+  if (name.includes('титул') || des.includes('титул') || notes.includes('титул')) return true;
+  if (name.includes('разделител') || des.includes('разделител') || notes.includes('разделител')) return true;
+  if (name.startsWith('раздел:') || des.startsWith('раздел:') || name.startsWith('раздел ') || des.startsWith('раздел ')) return true;
+  if (name === 'оглавление' || name === 'содержание' || des === 'оглавление' || des === 'содержание') return true;
+  if (name.includes('ведомость документов') || des.includes('ведомость документов')) return true;
+
+  // Exact section titles repeated without any real part details
+  const sectionKeywords = [
+    'токарные+фрезерные работы',
+    'токарные и фрезерные работы',
+    'токарно-фрезерные работы',
+    'токарные+фрезерные работы: лазер',
+    'токарные+фрезерные работы: вос',
+    'лазер',
+    'вос',
+    'стандарты',
+    'стандартные изделия',
+  ];
+
+  for (const kw of sectionKeywords) {
+    if (name === kw || des === kw) {
+      // If it doesn't have dimensions/length and has no material, it's just the section title page
+      if (!item.partLength && !item.material) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 function getFallbackDemoItems() {

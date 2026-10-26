@@ -2,7 +2,8 @@ import React, { useState } from 'react';
 import {
   DrawingItem,
   SECTIONS,
-  SectionType
+  SectionType,
+  isRodOrStud
 } from '../types';
 import {
   Edit3,
@@ -42,9 +43,12 @@ interface DrawingsTableProps {
   onBatchMoveSection: (ids: string[], newSection: SectionType) => void;
   onBatchToggleCnc?: (ids: string[], isCnc: boolean) => void;
   onBatchTogglePieceStock?: (ids: string[], isPieceStock: boolean) => void;
+  onCombineBillet?: (ids: string[]) => void;
+  onUncombineBillet?: (ids: string[]) => void;
   onEditModalOpen: (item: DrawingItem) => void;
   onOpenBlueprint: (item: DrawingItem) => void;
   pdfThumbnails?: Map<number, string>;
+  machinesCount?: number;
 }
 
 export const DrawingsTable: React.FC<DrawingsTableProps> = ({
@@ -57,19 +61,26 @@ export const DrawingsTable: React.FC<DrawingsTableProps> = ({
   onBatchMoveSection,
   onBatchToggleCnc,
   onBatchTogglePieceStock,
+  onCombineBillet,
+  onUncombineBillet,
   onEditModalOpen,
   onOpenBlueprint,
   pdfThumbnails,
+  machinesCount = 1,
 }) => {
   const [search, setSearch] = useState('');
   const [filterMissingQtyOnly, setFilterMissingQtyOnly] = useState(false);
   const [filterCncOnly, setFilterCncOnly] = useState(false);
   const [filterPieceStockOnly, setFilterPieceStockOnly] = useState(false);
+  const [filterCombinedOnly, setFilterCombinedOnly] = useState(false);
   const [filterNoStampOnly, setFilterNoStampOnly] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
-  // Filter items
-  const filteredItems = items.filter((item) => {
+  // Strict filter: Rods and studs MUST NEVER appear in the interactive table!
+  const visibleItems = items.filter(item => !isRodOrStud(item));
+
+  // Filter items for display
+  const filteredItems = visibleItems.filter((item) => {
     // Section filter
     if (selectedSection !== 'all' && item.section !== selectedSection) {
       return false;
@@ -84,6 +95,10 @@ export const DrawingsTable: React.FC<DrawingsTableProps> = ({
     }
     // Piece stock filter
     if (filterPieceStockOnly && !item.isPieceStock) {
+      return false;
+    }
+    // Combined billet filter
+    if (filterCombinedOnly && !item.combinedBilletGroupId) {
       return false;
     }
     // No stamp filter
@@ -168,9 +183,12 @@ export const DrawingsTable: React.FC<DrawingsTableProps> = ({
     }
   };
 
-  const cncCount = items.filter(it => it.isCnc).length;
-  const pieceStockCount = items.filter(it => it.isPieceStock).length;
-  const noStampCount = items.filter(it => it.hasNoStamp).length;
+  const cncCount = visibleItems.filter(it => it.isCnc).length;
+  const pieceStockCount = visibleItems.filter(it => it.isPieceStock).length;
+  const combinedCount = visibleItems.filter(it => Boolean(it.combinedBilletGroupId)).length;
+  const noStampCount = visibleItems.filter(it => it.hasNoStamp).length;
+  const rodsAndStudsCount = items.filter(it => isRodOrStud(it)).length;
+  const hasCombinedSelected = Array.from(selectedIds).some(id => items.find(it => it.id === id)?.combinedBilletGroupId);
 
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-2xl shadow-xl overflow-hidden">
@@ -193,6 +211,16 @@ export const DrawingsTable: React.FC<DrawingsTableProps> = ({
 
         {/* Filters and Actions */}
         <div className="flex items-center space-x-2 flex-wrap gap-y-2">
+          {rodsAndStudsCount > 0 && (
+            <div
+              className="px-2.5 py-1 rounded-xl bg-slate-800/80 border border-slate-700/80 text-[11px] text-slate-300 flex items-center space-x-1.5"
+              title="Прутки и шпильки скрыты из таблицы по регламенту, но будут включены в формируемый PDF-пакет"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+              <span>Прутки и шпильки ({rodsAndStudsCount} поз.): включены в PDF</span>
+            </div>
+          )}
+
           {/* CNC filter button */}
           <button
             onClick={() => setFilterCncOnly(!filterCncOnly)}
@@ -218,6 +246,21 @@ export const DrawingsTable: React.FC<DrawingsTableProps> = ({
             <Box className="w-3.5 h-3.5 text-indigo-400" />
             <span>Штучная заг. ({pieceStockCount})</span>
           </button>
+
+          {/* Combined billet filter button */}
+          {combinedCount > 0 && (
+            <button
+              onClick={() => setFilterCombinedOnly(!filterCombinedOnly)}
+              className={`px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center space-x-1.5 transition border ${
+                filterCombinedOnly
+                  ? 'bg-amber-600 text-white border-amber-500 shadow-sm'
+                  : 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700'
+              }`}
+            >
+              <Layers className="w-3.5 h-3.5 text-amber-400" />
+              <span>Объединенные ({combinedCount})</span>
+            </button>
+          )}
 
           {/* Missing Qty Filter */}
           <button
@@ -269,6 +312,35 @@ export const DrawingsTable: React.FC<DrawingsTableProps> = ({
           </div>
 
           <div className="flex items-center space-x-2 flex-wrap gap-y-1">
+            {/* Combine into single billet button */}
+            {selectedIds.size >= 2 && onCombineBillet && (
+              <button
+                onClick={() => {
+                  onCombineBillet(Array.from(selectedIds));
+                  setSelectedIds(new Set());
+                }}
+                className="px-3 py-1 bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 text-white rounded-lg text-xs font-bold flex items-center space-x-1.5 shadow-sm transition"
+                title="Объединить выбранные детали в одну общую заготовку"
+              >
+                <Layers className="w-3.5 h-3.5" />
+                <span>Объединить в одну заготовку ({selectedIds.size})</span>
+              </button>
+            )}
+
+            {/* Uncombine if any selected item is already in a combined group */}
+            {hasCombinedSelected && onUncombineBillet && (
+              <button
+                onClick={() => {
+                  onUncombineBillet(Array.from(selectedIds));
+                  setSelectedIds(new Set());
+                }}
+                className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-600/50 rounded-lg text-xs font-semibold flex items-center space-x-1 transition"
+                title="Исключить выбранные детали из объединенной заготовки"
+              >
+                <span>Разъединить</span>
+              </button>
+            )}
+
             {/* CNC Batch actions */}
             <button
               onClick={() => handleBatchCnc(true)}
@@ -373,13 +445,22 @@ export const DrawingsTable: React.FC<DrawingsTableProps> = ({
                   <span>Штучная заг.</span>
                 </div>
               </th>
-              <th className="py-3 px-3 min-w-[140px] text-center" title="Длина заготовки исходя из длины детали, количества, ЧПУ, штучной заготовки и ограничения 1000 мм">
+              <th className="py-3 px-3 min-w-[160px] text-center" title="Длина заготовки исходя из формулы или ручной корректировки">
                 <div className="flex items-center justify-center space-x-1">
                   <Calculator className="w-3.5 h-3.5 text-amber-400" />
                   <span>Длина заготовки</span>
                 </div>
               </th>
-              <th className="py-3 px-3 min-w-[110px] text-center">Количество</th>
+              <th className="py-3 px-3 min-w-[110px] text-center">
+                {machinesCount > 1 ? (
+                  <div className="flex flex-col items-center">
+                    <span>Количество</span>
+                    <span className="text-[10px] text-amber-300 font-mono font-normal">План: {machinesCount} маш.</span>
+                  </div>
+                ) : (
+                  <span>Количество (шт)</span>
+                )}
+              </th>
               <th className="py-3 px-3 min-w-[120px]">Код по 1С</th>
               <th className="py-3 px-3 min-w-[170px]">Раздел</th>
               <th className="py-3 px-3 min-w-[120px]">Материал</th>
@@ -522,6 +603,23 @@ export const DrawingsTable: React.FC<DrawingsTableProps> = ({
                                 </span>
                               </div>
                             )}
+                            {/* Combined Billet Group Badge */}
+                            {item.combinedBilletGroupId && (
+                              <div className="inline-flex items-center space-x-1 text-[10px] bg-amber-500/15 text-amber-300 border border-amber-500/30 px-1.5 py-0.5 rounded font-medium mt-0.5 ml-2">
+                                <Layers className="w-2.5 h-2.5 text-amber-400" />
+                                <span>{item.combinedBilletName || 'Объединенная заготовка'}</span>
+                                {onUncombineBillet && (
+                                  <button
+                                    type="button"
+                                    onClick={() => onUncombineBillet([item.id])}
+                                    className="text-amber-400 hover:text-white ml-1 text-[9px] hover:bg-amber-500/20 px-1 rounded transition"
+                                    title="Исключить эту деталь из общей заготовки"
+                                  >
+                                    ✕
+                                  </button>
+                                )}
+                              </div>
+                            )}
                           </td>
 
                           {/* Part Length (Длина детали) */}
@@ -573,45 +671,110 @@ export const DrawingsTable: React.FC<DrawingsTableProps> = ({
                             </button>
                           </td>
 
-                          {/* Billet Length (Длина заготовки) */}
+                          {/* Billet Length (Длина заготовки с возможностью ручной правки) */}
                           <td className="py-2.5 px-2 text-center">
                             {(() => {
-                              const billet = calculateBillet(item);
-                              if (!billet.hasLength || billet.billetLength === null) {
+                              const billet = calculateBillet(item, items);
+                              if (billet.isSubsequentCombinedItem) {
                                 return (
-                                  <span className="text-slate-600 text-xs font-mono" title="Укажите длину детали для расчета заготовки">
+                                  <div className="flex flex-col items-center justify-center space-y-0.5">
+                                    <div
+                                      className="px-2 py-0.5 rounded text-[10px] font-mono font-bold tracking-tight border bg-amber-500/20 text-amber-200 border-amber-500/40 shadow-sm cursor-help text-center max-w-[170px] truncate"
+                                      title={billet.stampText || 'заг на чертеже'}
+                                    >
+                                      {billet.stampText}
+                                    </div>
+                                    <div className="text-[9px] text-amber-400/90 font-medium flex items-center space-x-0.5">
+                                      <Layers className="w-2.5 h-2.5" />
+                                      <span>{item.combinedBilletName || 'Объединено'} (Лист {item.pageNumber || 1})</span>
+                                    </div>
+                                  </div>
+                                );
+                              }
+
+                              const hasValue = billet.hasLength || (item.manualBilletLength !== undefined && item.manualBilletLength !== null);
+                              if (!hasValue && billet.billetLength === null) {
+                                return (
+                                  <span className="text-slate-600 text-xs font-mono" title="Укажите длину детали для расчета заготовки или введите длину вручную">
                                     —
                                   </span>
                                 );
                               }
+
                               return (
-                                <div className="flex flex-col items-center justify-center space-y-0.5">
-                                  <div className="flex items-center space-x-1 font-mono font-bold text-amber-300 text-xs">
-                                    <span>{billet.billetLength} мм</span>
-                                    {billet.billetCount && billet.billetCount > 1 && (
-                                      <span className="text-[10px] text-amber-400/80 font-normal">
-                                        ({billet.billetCount} шт.)
+                                <div className="flex flex-col items-center justify-center space-y-1">
+                                  {/* Input for manual length or formula length */}
+                                  <div className="flex items-center justify-center space-x-1">
+                                    <input
+                                      type="number"
+                                      min="1"
+                                      value={item.manualBilletLength ?? ''}
+                                      onChange={(e) => {
+                                        const val = e.target.value === '' ? null : Number(e.target.value);
+                                        onUpdateItem({ ...item, manualBilletLength: val });
+                                      }}
+                                      placeholder={billet.billetLength ? `${billet.billetLength}` : '—'}
+                                      className={`w-16 text-center font-mono font-bold px-1.5 py-0.5 rounded text-xs border focus:outline-none transition ${
+                                        item.manualBilletLength
+                                          ? 'bg-amber-950/70 border-amber-500 text-amber-200 ring-1 ring-amber-500/40 shadow-sm'
+                                          : 'bg-slate-800/80 border-slate-700 text-amber-300 hover:border-slate-600 focus:border-amber-500'
+                                      }`}
+                                      title={
+                                        item.manualBilletLength
+                                          ? `Ручная длина заготовки: ${item.manualBilletLength} мм. Нажмите ✕ для сброса на расчет по формуле`
+                                          : `Авторасчет: ${billet.billetLength || '—'} мм. Введите число для ручной корректировки`
+                                      }
+                                    />
+                                    <span className="text-[10px] text-slate-400 font-mono">мм</span>
+                                    {item.manualBilletLength ? (
+                                      <button
+                                        type="button"
+                                        onClick={() => onUpdateItem({ ...item, manualBilletLength: null })}
+                                        className="text-slate-400 hover:text-rose-400 text-xs p-0.5 transition"
+                                        title="Сбросить ручную длину на автоматический расчет"
+                                      >
+                                        ✕
+                                      </button>
+                                    ) : null}
+                                  </div>
+
+                                  {/* KD stamp format badge */}
+                                  <div className="flex items-center space-x-1">
+                                    {item.manualBilletLength ? (
+                                      <span className="text-[9px] bg-amber-500/30 text-amber-300 border border-amber-500/50 px-1 py-0.2 rounded font-semibold">
+                                        Ручная
                                       </span>
-                                    )}
+                                    ) : null}
+                                    <div
+                                      className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-bold tracking-tight border cursor-help ${
+                                        billet.isCombinedBillet
+                                          ? 'bg-gradient-to-r from-amber-500/25 to-amber-600/25 text-amber-200 border-amber-500/50 shadow-sm'
+                                          : item.manualBilletLength
+                                          ? 'bg-amber-950/40 text-amber-300 border-amber-500/40'
+                                          : billet.isRestrictedBy1000
+                                          ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                                          : item.isPieceStock
+                                          ? 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40'
+                                          : 'bg-slate-800 text-slate-300 border-slate-700'
+                                      }`}
+                                      title={`${billet.formulaDesc}${billet.isRestrictedBy1000 ? ' (ограничение 1000 мм)' : ''}`}
+                                    >
+                                      {billet.kdString}
+                                    </div>
                                   </div>
-                                  <div
-                                    className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-bold tracking-tight border cursor-help ${
-                                      billet.isRestrictedBy1000
-                                        ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
-                                        : item.isPieceStock
-                                        ? 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40'
-                                        : 'bg-slate-800 text-slate-300 border-slate-700'
-                                    }`}
-                                    title={`${billet.formulaDesc}${billet.isRestrictedBy1000 ? ' (сработало ограничение 1000 мм: разбито на несколько заготовок)' : ''}`}
-                                  >
-                                    {billet.kdString}
-                                  </div>
+
+                                  {billet.isCombinedBillet && (
+                                    <div className="text-[9px] text-emerald-400 font-medium flex items-center space-x-0.5">
+                                      <Layers className="w-2.5 h-2.5" />
+                                      <span>{item.combinedBilletName || 'Объединено'} (1-й лист)</span>
+                                    </div>
+                                  )}
                                 </div>
                               );
                             })()}
                           </td>
 
-                          {/* Quantity (Количество) */}
+                          {/* Quantity (Количество с учетом плана машин) */}
                           <td className="py-2.5 px-3 text-center">
                             <div className="inline-flex items-center space-x-1">
                               <input
@@ -620,7 +783,15 @@ export const DrawingsTable: React.FC<DrawingsTableProps> = ({
                                 value={item.quantity ?? ''}
                                 onChange={(e) => {
                                   const val = e.target.value === '' ? null : Number(e.target.value);
-                                  onUpdateItem({ ...item, quantity: val, qtySource: 'manual' });
+                                  const perMach = val !== null && machinesCount > 0
+                                    ? Math.round(val / machinesCount)
+                                    : val;
+                                  onUpdateItem({
+                                    ...item,
+                                    quantity: val,
+                                    quantityPerMachine: perMach,
+                                    qtySource: 'manual'
+                                  });
                                 }}
                                 placeholder="0"
                                 className={`w-16 text-center font-bold px-2 py-1 rounded border text-xs focus:outline-none ${
@@ -632,11 +803,18 @@ export const DrawingsTable: React.FC<DrawingsTableProps> = ({
                               <span className="text-[10px] text-slate-500">шт</span>
                             </div>
 
+                            {/* Multi-machine breakdown */}
+                            {machinesCount > 1 && item.quantity !== null && item.quantity > 0 && (
+                              <div className="text-[10px] text-amber-300/90 font-mono mt-0.5 whitespace-nowrap">
+                                {item.quantityPerMachine ?? Math.round(item.quantity / machinesCount)} шт × {machinesCount} маш.
+                              </div>
+                            )}
+
                             {/* Source Badge */}
                             <div className="mt-1">
                               {item.qtySource === 'excel' && (
                                 <span className="inline-block text-[9px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 px-1.5 py-0.2 rounded font-medium">
-                                  Из Excel
+                                  Из Excel {machinesCount > 1 ? `(×${machinesCount})` : ''}
                                 </span>
                               )}
                               {item.qtySource === 'drawing' && (

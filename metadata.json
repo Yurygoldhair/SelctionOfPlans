@@ -2,5 +2,7 @@
   "name": "Парсер чертежей в Excel и 1С",
   "description": "Извлечение спецификаций из чертежей PDF по 4 производственным разделам, длины деталей, ЧПУ, эскизов без рамки, сопоставление количеств из Excel и печать в PDF",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
