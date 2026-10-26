@@ -132,3 +132,47 @@ export async function generatePdfPageThumbnails(
     return thumbnails;
   }
 }
+
+/**
+ * Extracts text content from each page of a PDF document.
+ * This produces lightweight page text payloads (15-50KB) that bypass all network/payload limits.
+ */
+export async function extractPdfTextPages(
+  pdfData: Uint8Array | ArrayBuffer | string
+): Promise<Array<{ pageNumber: number; text: string }>> {
+  try {
+    let data: Uint8Array;
+    if (typeof pdfData === 'string') {
+      data = base64ToUint8Array(pdfData);
+    } else if (pdfData instanceof ArrayBuffer) {
+      data = new Uint8Array(pdfData);
+    } else {
+      data = pdfData;
+    }
+
+    const loadingTask = pdfjsLib.getDocument({ data });
+    const pdfDoc = await loadingTask.promise;
+    const pages: Array<{ pageNumber: number; text: string }> = [];
+
+    for (let p = 1; p <= pdfDoc.numPages; p++) {
+      try {
+        const page = await pdfDoc.getPage(p);
+        const textContent = await page.getTextContent();
+        const text = textContent.items
+          .map((item: any) => ('str' in item ? item.str : ''))
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        pages.push({ pageNumber: p, text });
+      } catch (e) {
+        pages.push({ pageNumber: p, text: '' });
+      }
+    }
+
+    return pages;
+  } catch (error) {
+    console.error('Error extracting text from PDF:', error);
+    return [];
+  }
+}
+

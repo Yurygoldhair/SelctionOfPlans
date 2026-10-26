@@ -50,16 +50,49 @@ export function isRodOrStud(it: any): boolean {
   const d = String(it.designation || '').toLowerCase();
   const s = String(it.section || '').toLowerCase();
   const notes = String(it.notes || '').toLowerCase();
-  return (
+  const mat = String(it.material || '').toLowerCase();
+
+  // 1. Direct keywords in any field
+  if (
     n.includes('прут') ||
     n.includes('шпильк') ||
+    n.includes('штанга') ||
+    n.includes('стержен') ||
     d.includes('прут') ||
     d.includes('шпильк') ||
+    d.includes('штанга') ||
+    d.includes('стержен') ||
     s.includes('прут') ||
     s.includes('шпильк') ||
     notes.includes('прут') ||
-    notes.includes('шпильк')
-  );
+    notes.includes('шпильк') ||
+    mat.includes('пруток') ||
+    mat.includes('прутк')
+  ) {
+    return true;
+  }
+
+  // 2. Official GOST and DIN standards for studs and threaded rods:
+  // DIN 975, DIN 976 (шпильки резьбовые полнорезьбовые)
+  // ГОСТ 22032 .. ГОСТ 22043 (шпильки с ввинчиваемым концом и для гладких отверстий)
+  // ГОСТ 9066 (шпильки для фланцевых соединений)
+  // ГОСТ 10494 (шпильки)
+  if (
+    d.includes('975') ||
+    d.includes('976') ||
+    n.includes('975') ||
+    n.includes('976') ||
+    /220(3[2-9]|4[0-3])/i.test(d) ||
+    /220(3[2-9]|4[0-3])/i.test(n) ||
+    /9066/i.test(d) ||
+    /9066/i.test(n) ||
+    /10494/i.test(d) ||
+    /10494/i.test(n)
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 export interface BatchSession {
@@ -118,6 +151,7 @@ export interface ExcelMatchResult {
     sumRowCount?: number;
     sumDetails?: string;
   }>;
+  newItemsFromExcel?: DrawingItem[]; // Позиции из Excel, которых не было в таблице чертежей (доступны для добавления)
 }
 
 export interface ExtractionProgress {

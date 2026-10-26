@@ -13,7 +13,8 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
 // High payload limit for engineering PDF drawings
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '100mb' }));
+app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
 // Initialize GoogleGenAI client (Server-side only)
 const ai = new GoogleGenAI({
@@ -87,11 +88,13 @@ app.post('/api/extract-drawings', async (req, res) => {
 - isCnc: булево значение true / false (ЧПУ):
   * true — если на чертеже есть отметки ЧПУ, CNC, токарно-фрезерная с ЧПУ, 3D криволинейный контур, фрезеровка карманов со сложной геометрией, высокая точность обработки
   * false — если обычная обработка на универсальных станках или стандарты
-- section: строго точное название раздела из найденного титульного листа:
+- section: точное название раздела из найденного титульного листа:
   * "Токарные+фрезерные работы"
   * "Токарные+фрезерные работы: Лазер"
   * "Токарные+фрезерные работы: ВОС"
   * "Стандарты"
+  * "Прутки и шпильки" (если в комплекте есть титульный лист/разделитель "Прутки и шпильки")
+- isRodOrStud: булево значение true / false (ОБЯЗАТЕЛЬНО ставь true для любых деталей из раздела "Прутки и шпильки", а также для любых шпилек (ГОСТ 22032-22043, ГОСТ 9066, DIN 975/976), прутков, резьбовых штанг, стяжек и сортового проката; false для обычных токарно-фрезерных деталей)
 - material: материал детали из графы 3 штампа (например 'Сталь 40Х', 'Д16Т', '12Х18Н10Т')
 - pageNumber: номер страницы PDF, где расположен данный чертеж
 - isHighlighted: true (если позиция визуально выделена маркером, цветом, рамкой, или помечена) / false
@@ -121,6 +124,7 @@ app.post('/api/extract-drawings', async (req, res) => {
       "code1C": "string",
       "partLength": "180 мм",
       "isCnc": true,
+      "isRodOrStud": false,
       "hasNoStamp": false,
       "identificationMark": "",
       "section": "Токарные+фрезерные работы",
@@ -137,7 +141,7 @@ app.post('/api/extract-drawings', async (req, res) => {
 СТРОГО отслеживай последовательно по страницам, под каким именно титульником находятся детали, и вноси их именно в тот раздел!
 ВАЖНЕЙШИЕ ПРАВИЛА:
 1. Титульные листы разделов (страницы с названиями разделов) НЕ ДОБАВЛЯЙ в список деталей items!
-2. "Прутки и шпильки" (титульные листы или позиции шпилек/прутков) НЕ ДОБАВЛЯЙ в массив items! Они остаются в исходном PDF, но в таблицу деталей не заносятся.
+2. Для ЛЮБЫХ шпилек (ГОСТ 22032..22043, ГОСТ 9066, DIN 975, DIN 976), прутков, резьбовых штанг или любых деталей, идущих за титульным листом "Прутки и шпильки": ОБЯЗАТЕЛЬНО установи "isRodOrStud": true и "section": "Прутки и шпильки"!
 3. Для каждой детали обязательно извлеки:
    - "partLength" (Длину детали из размеров чертежа: L, длина вала/втулки/пластины в мм).
    - "isCnc" (Чекбокс ЧПУ: true если деталь требует обработки на ЧПУ).
@@ -185,43 +189,7 @@ app.post('/api/extract-drawings', async (req, res) => {
     const realRawItems = rawItems.filter((item: any) => !isTitleOrCoverSheet(item));
 
     // Map and sanitize items
-    const formattedItems = realRawItems.map((item: any, idx: number) => {
-      const name = item.name || `Деталь поз. ${idx + 1}`;
-      const des = item.designation || (item.identificationMark ? `Опознано: ${item.identificationMark}` : `Чертеж без номера (лист ${item.pageNumber || idx + 1})`);
-      const notes = item.notes || '';
-      const sec = sanitizeSection(item.section);
-
-      const isRod = (
-        name.toLowerCase().includes('прут') ||
-        name.toLowerCase().includes('шпильк') ||
-        des.toLowerCase().includes('прут') ||
-        des.toLowerCase().includes('шпильк') ||
-        notes.toLowerCase().includes('прут') ||
-        notes.toLowerCase().includes('шпильк') ||
-        sec.toLowerCase().includes('прут') ||
-        sec.toLowerCase().includes('шпильк')
-      );
-
-      return {
-        id: `ext-${Date.now()}-${idx}`,
-        name,
-        designation: des,
-        quantity: typeof item.quantity === 'number' ? item.quantity : null,
-        code1C: item.code1C || '',
-        partLength: item.partLength ? String(item.partLength) : '',
-        isCnc: Boolean(item.isCnc),
-        isPieceStock: Boolean(item.isPieceStock),
-        isRodOrStud: Boolean(isRod),
-        hasNoStamp: Boolean(item.hasNoStamp || (!item.designation && item.identificationMark)),
-        identificationMark: item.identificationMark || '',
-        section: sec,
-        material: item.material || '',
-        pageNumber: typeof item.pageNumber === 'number' ? item.pageNumber : (idx + 1),
-        isHighlighted: Boolean(item.isHighlighted),
-        notes,
-        qtySource: typeof item.quantity === 'number' ? 'drawing' : 'missing',
-      };
-    });
+    const formattedItems = processRawGeminiItems(realRawItems);
 
     return res.json({
       success: true,
@@ -239,9 +207,171 @@ app.post('/api/extract-drawings', async (req, res) => {
   }
 });
 
+/**
+ * Lightweight text-based extraction endpoint.
+ * Accepts pre-extracted page texts from the client (15-50KB JSON payload),
+ * completely eliminating network timeouts and payload limits on large PDF drawings.
+ */
+app.post('/api/extract-drawings-text', async (req, res) => {
+  try {
+    const { fileName, pageTexts } = req.body;
+
+    if (!Array.isArray(pageTexts) || pageTexts.length === 0) {
+      return res.status(400).json({ error: 'Page texts array is empty' });
+    }
+
+    if (!process.env.GEMINI_API_KEY) {
+      return res.json({
+        success: true,
+        isDemoFallback: true,
+        items: getFallbackDemoItems(),
+      });
+    }
+
+    const pagesSummary = pageTexts
+      .map((p: any) => `[СТРАНИЦА ${p.pageNumber || '?'}]\n${String(p.text || '').slice(0, 1500)}`)
+      .join('\n\n');
+
+    const promptText = `Пожалуйста, проанализируй текстовый слой страниц комплекта чертежей "${fileName || 'чертежи.pdf'}".
+Каждая страница чертежа представлена ниже с ее номером и текстом штампов/размеров/надписей:
+
+${pagesSummary}
+
+ВАЖНЕЙШИЕ ПРАВИЛА:
+1. Титульные листы разделов (страницы с названиями разделов) НЕ ДОБАВЛЯЙ в список деталей items!
+2. Для ЛЮБЫХ шпилек (ГОСТ 22032..22043, ГОСТ 9066, DIN 975, DIN 976), прутков, резьбовых штанг или любых деталей, идущих за титульным листом "Прутки и шпильки": ОБЯЗАТЕЛЬНО установи "isRodOrStud": true и "section": "Прутки и шпильки"!
+3. Для каждой детали обязательно извлеки:
+   - "name": наименование детали из штампа
+   - "designation": обозначение чертежа ЕСКД
+   - "partLength": длина детали L из размеров (например "180 мм", "350")
+   - "isCnc": булево true если ЧПУ
+   - "section": "Токарные+фрезерные работы" | "Токарные+фрезерные работы: Лазер" | "Токарные+фрезерные работы: ВОС" | "Стандарты" | "Прутки и шпильки"
+   - "material": марка материала
+   - "pageNumber": номер страницы
+4. Если рамки и штампа нет — укажи найденный опознавательный знак в designation с hasNoStamp: true.`;
+
+    const systemInstruction = `Ты — ведущий инженер-технолог и нормоконтролер машиностроительного производства.
+Твоя задача — детально проанализировать текст страниц комплекта чертежей по ЕСКД и выделить спецификацию деталей.
+Верни ответ в формате JSON:
+{
+  "detectedSections": ["Токарные+фрезерные работы", ...],
+  "items": [
+    {
+      "name": "string",
+      "designation": "string",
+      "quantity": 10,
+      "code1C": "string",
+      "partLength": "180 мм",
+      "isCnc": true,
+      "isRodOrStud": false,
+      "hasNoStamp": false,
+      "identificationMark": "",
+      "section": "Токарные+фрезерные работы",
+      "material": "string",
+      "pageNumber": 2,
+      "isHighlighted": false,
+      "notes": "string"
+    }
+  ]
+}`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: promptText,
+      config: {
+        systemInstruction,
+        responseMimeType: 'application/json',
+      },
+    });
+
+    const responseText = response.text || '{}';
+    let parsedData: any;
+    try {
+      parsedData = JSON.parse(responseText);
+    } catch {
+      const match = responseText.match(/\{[\s\S]*\}/);
+      if (match) parsedData = JSON.parse(match[0]);
+      else throw new Error('Model did not return valid JSON');
+    }
+
+    const rawItems = Array.isArray(parsedData.items) ? parsedData.items : [];
+    const realRawItems = rawItems.filter((item: any) => !isTitleOrCoverSheet(item));
+    const formattedItems = processRawGeminiItems(realRawItems);
+
+    return res.json({
+      success: true,
+      items: formattedItems,
+      detectedSections: parsedData.detectedSections || [],
+      count: formattedItems.length,
+    });
+  } catch (error: any) {
+    console.error('Error in /api/extract-drawings-text:', error);
+    const msg = error?.message || String(error);
+    res.status(500).json({
+      error: `Ошибка при обработке текста PDF: ${msg}`,
+      details: msg,
+    });
+  }
+});
+
+function processRawGeminiItems(realRawItems: any[]): any[] {
+  return realRawItems.map((item: any, idx: number) => {
+    const name = item.name || `Деталь поз. ${idx + 1}`;
+    const des = item.designation || (item.identificationMark ? `Опознано: ${item.identificationMark}` : `Чертеж без номера (лист ${item.pageNumber || idx + 1})`);
+    const notes = item.notes || '';
+    const rawSec = String(item.section || '').trim();
+    const sec = sanitizeSection(rawSec);
+
+    const isRod = (
+      Boolean(item.isRodOrStud) ||
+      rawSec.toLowerCase().includes('прут') ||
+      rawSec.toLowerCase().includes('шпильк') ||
+      sec.toLowerCase().includes('прут') ||
+      sec.toLowerCase().includes('шпильк') ||
+      name.toLowerCase().includes('прут') ||
+      name.toLowerCase().includes('шпильк') ||
+      name.toLowerCase().includes('штанга') ||
+      name.toLowerCase().includes('стержен') ||
+      des.toLowerCase().includes('прут') ||
+      des.toLowerCase().includes('шпильк') ||
+      des.toLowerCase().includes('штанга') ||
+      des.toLowerCase().includes('стержен') ||
+      notes.toLowerCase().includes('прут') ||
+      notes.toLowerCase().includes('шпильк') ||
+      /220(3[2-9]|4[0-3])/i.test(des) ||
+      /220(3[2-9]|4[0-3])/i.test(name) ||
+      /9066/i.test(des) ||
+      /9066/i.test(name) ||
+      /97[56]/i.test(des) ||
+      /97[56]/i.test(name)
+    );
+
+    return {
+      id: `ext-${Date.now()}-${idx}`,
+      name,
+      designation: des,
+      quantity: typeof item.quantity === 'number' ? item.quantity : null,
+      code1C: item.code1C || '',
+      partLength: item.partLength ? String(item.partLength) : '',
+      isCnc: Boolean(item.isCnc),
+      isPieceStock: Boolean(item.isPieceStock),
+      isRodOrStud: Boolean(isRod),
+      hasNoStamp: Boolean(item.hasNoStamp || (!item.designation && item.identificationMark)),
+      identificationMark: item.identificationMark || '',
+      section: sec,
+      material: item.material || '',
+      pageNumber: typeof item.pageNumber === 'number' ? item.pageNumber : (idx + 1),
+      isHighlighted: Boolean(item.isHighlighted),
+      notes,
+      qtySource: typeof item.quantity === 'number' ? 'drawing' : 'missing',
+    };
+  });
+}
+
 function sanitizeSection(rawSection: string): string {
   if (!rawSection) return 'Токарные+фрезерные работы';
   const s = rawSection.toLowerCase();
+  if (s.includes('прут') || s.includes('шпильк')) return 'Прутки и шпильки';
   if (s.includes('лазер')) return 'Токарные+фрезерные работы: Лазер';
   if (s.includes('вос')) return 'Токарные+фрезерные работы: ВОС';
   if (s.includes('стандарт') || s.includes('гост') || s.includes('din') || s.includes('крепеж')) return 'Стандарты';

@@ -26,9 +26,10 @@ import {
   updateSession,
   deleteSessionById,
   getActiveSessionId,
-  setActiveSessionId
+  setActiveSessionId,
+  getPdfFromStorage
 } from './utils/sessionStorage';
-import { generatePdfPageThumbnails } from './utils/pdfRenderer';
+import { generatePdfPageThumbnails, extractPdfTextPages } from './utils/pdfRenderer';
 import { CheckCircle, AlertCircle, Info, Sparkles } from 'lucide-react';
 
 export default function App() {
@@ -85,16 +86,19 @@ export default function App() {
       const active = loadedSessions.find(s => s.id === activeId);
       if (active) {
         setItems(active.items);
-        setCurrentPdfBase64(active.pdfBase64);
         setCurrentPdfName(active.pdfFileName);
         if (active.machinesCount && active.machinesCount > 0) {
           setMachinesCount(active.machinesCount);
         }
-        if (active.pdfBase64) {
-          generatePdfPageThumbnails(active.pdfBase64, active.id).then(thumbs => {
-            setPdfThumbnails(thumbs);
-          });
-        }
+        getPdfFromStorage(active.id).then((b64: string | undefined) => {
+          const finalB64 = b64 || active.pdfBase64;
+          if (finalB64) {
+            setCurrentPdfBase64(finalB64);
+            generatePdfPageThumbnails(finalB64, active.id).then(thumbs => {
+              setPdfThumbnails(thumbs);
+            });
+          }
+        });
       }
     }
   }, []);
@@ -185,22 +189,58 @@ export default function App() {
             message: 'Нейросеть Gemini анализирует титульные листы 4 разделов и штампы чертежей...',
           });
 
-          const res = await fetch('/api/extract-drawings', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              pdfBase64: base64Data,
-              fileName: file.name,
-            }),
-          });
+          let data: any;
 
-          if (!res.ok) {
-            const errData = await res.json().catch(() => ({}));
-            throw new Error(errData.error || errData.details || `Ошибка сервера: ${res.status}`);
+          // Strategy 1: For files <= 8MB, try direct visual binary extraction first
+          if (file.size <= 8 * 1024 * 1024) {
+            try {
+              const res = await fetch('/api/extract-drawings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  pdfBase64: base64Data,
+                  fileName: file.name,
+                }),
+              });
+              if (res.ok) {
+                data = await res.json();
+              }
+            } catch (netErr) {
+              console.warn('Binary upload failed, falling back to client-side text layer extraction...', netErr);
+            }
           }
 
-          const data = await res.json();
-          if (data.items && Array.isArray(data.items)) {
+          // Strategy 2: If binary upload was skipped (large file) or failed (network/timeout),
+          // extract the text layer in the client and call the lightweight text endpoint (15-50KB)
+          if (!data || !data.items || data.items.length === 0) {
+            setProgress({
+              status: 'analyzing_ai',
+              message: 'Извлечение текстового слоя чертежей и отправка на анализ...',
+            });
+
+            const pageTexts = await extractPdfTextPages(base64Data);
+            if (pageTexts.length === 0) {
+              throw new Error('Не удалось прочитать страницы PDF. Проверьте файл на повреждения.');
+            }
+
+            const textRes = await fetch('/api/extract-drawings-text', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                fileName: file.name,
+                pageTexts,
+              }),
+            });
+
+            if (!textRes.ok) {
+              const errData = await textRes.json().catch(() => ({}));
+              throw new Error(errData.error || errData.details || `Ошибка сервера: ${textRes.status}`);
+            }
+
+            data = await textRes.json();
+          }
+
+          if (data && data.items && Array.isArray(data.items)) {
             // "новая загрузка пдф это новый отбор"
             const newTitle = `Отбор №${sessions.length + 1} — ${file.name.replace(/\.pdf$/i, '')}`;
             const newSession = createNewSession(newTitle, data.items, file.name, base64Data);
@@ -255,7 +295,7 @@ export default function App() {
       try {
         const buffer = e.target?.result as ArrayBuffer;
         const parsed = parseExcelFile(buffer);
-        const autoMapping = autoDetectColumns(parsed.headers);
+        const autoMapping = autoDetectColumns(parsed.headers, parsed.rows);
 
         setExcelModalData({
           isOpen: true,
@@ -277,7 +317,7 @@ export default function App() {
    */
   const handleApplySampleExcel = () => {
     const headers = Object.keys(SAMPLE_EXCEL_BOM_ROWS[0]);
-    const autoMapping = autoDetectColumns(headers);
+    const autoMapping = autoDetectColumns(headers, SAMPLE_EXCEL_BOM_ROWS);
 
     setExcelModalData({
       isOpen: true,
@@ -291,9 +331,63 @@ export default function App() {
   /**
    * Handler when matches from Excel are applied
    */
-  const handleApplyExcelMatches = (updatedItems: DrawingItem[]) => {
-    syncItemsToActiveSession(updatedItems);
-    showToast('Количества и коды 1С успешно обновлены из файла Excel!', 'success');
+  const handleApplyExcelMatches = (
+    updatedMachinedItems: DrawingItem[],
+    newExcelItems: DrawingItem[] = []
+  ) => {
+    // 1. Separate existing items into rod/stud vs machined items
+    const existingRodStuds = items.filter(it => isRodOrStud(it));
+    const existingMachined = items.filter(it => !isRodOrStud(it));
+
+    // 2. Map existing machined items to updated versions
+    const updatedMap = new Map(updatedMachinedItems.map(it => [it.id, it]));
+    const updatedMachined = existingMachined.map(it => updatedMap.get(it.id) || it);
+
+    // 3. Process new items from Excel
+    const newMachinedToAdd: DrawingItem[] = [];
+    const newRodsToAdd: DrawingItem[] = [];
+
+    newExcelItems.forEach(newItem => {
+      if (isRodOrStud(newItem)) {
+        newRodsToAdd.push({
+          ...newItem,
+          isRodOrStud: true,
+        });
+      } else {
+        newMachinedToAdd.push({
+          ...newItem,
+          isRodOrStud: false,
+        });
+      }
+    });
+
+    // 4. Combine all items:
+    // Machined parts will show in the interactive table!
+    // Rods and studs are saved with isRodOrStud: true, so they remain excluded from DrawingsTable,
+    // but are fully included for PDF generation and stamping!
+    const finalItems = [...updatedMachined, ...newMachinedToAdd, ...existingRodStuds, ...newRodsToAdd];
+    syncItemsToActiveSession(finalItems);
+
+    const updatedCount = updatedMachinedItems.length;
+    const addedMachinedCount = newMachinedToAdd.length;
+    const addedRodsCount = newRodsToAdd.length;
+
+    let msg = '';
+    if (updatedCount > 0 && addedMachinedCount > 0) {
+      msg = `Обновлено ${updatedCount} чертежей, добавлено ${addedMachinedCount} новых деталей из Excel в таблицу!`;
+    } else if (addedMachinedCount > 0) {
+      msg = `Добавлено ${addedMachinedCount} новых деталей из Excel в таблицу чертежей!`;
+    } else if (updatedCount > 0) {
+      msg = `Обновлено ${updatedCount} чертежей из файла Excel!`;
+    } else {
+      msg = `Данные из Excel успешно применены!`;
+    }
+
+    if (addedRodsCount > 0) {
+      msg += ` (${addedRodsCount} прутков/шпилек отфильтровано из таблицы, но сохранено для PDF)`;
+    }
+
+    showToast(msg, 'success');
   };
 
   /**
@@ -414,15 +508,19 @@ export default function App() {
       setActiveSessionId(id);
       setActiveSessionState(id);
       setItems(s.items);
-      setCurrentPdfBase64(s.pdfBase64);
       setCurrentPdfName(s.pdfFileName);
-      if (s.pdfBase64) {
-        generatePdfPageThumbnails(s.pdfBase64, s.id).then(thumbs => {
-          setPdfThumbnails(thumbs);
-        });
-      } else {
-        setPdfThumbnails(new Map());
-      }
+
+      getPdfFromStorage(s.id).then((b64: string | undefined) => {
+        const finalB64 = b64 || s.pdfBase64;
+        setCurrentPdfBase64(finalB64);
+        if (finalB64) {
+          generatePdfPageThumbnails(finalB64, s.id).then(thumbs => {
+            setPdfThumbnails(thumbs);
+          });
+        } else {
+          setPdfThumbnails(new Map());
+        }
+      });
       showToast(`Открыт отбор: "${s.title}"`, 'info');
     }
   };
@@ -596,7 +694,7 @@ export default function App() {
           fileName={excelModalData.fileName}
           headers={excelModalData.headers}
           rows={excelModalData.rows}
-          currentItems={items}
+          currentItems={items.filter(it => !isRodOrStud(it))}
           initialMapping={excelModalData.mapping}
           onApplyMatches={handleApplyExcelMatches}
           machinesCount={machinesCount}
